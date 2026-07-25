@@ -1193,6 +1193,9 @@ class ProjectManager(QWidget):
         self.tab_widget = QTabWidget()
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.setMovable(True)  # タブをドラッグで並べ替え
+        self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tab_widget.tabBar().customContextMenuRequested.connect(
+            self.open_project_context_menu)
         self.layout.addWidget(self.tab_widget)
 
         # 前回のタブ順・選択タブを復元
@@ -1242,6 +1245,125 @@ class ProjectManager(QWidget):
                           indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"workspace.json の保存に失敗: {e}")
+
+    def open_project_context_menu(self, pos):
+        tab_bar = self.tab_widget.tabBar()
+        index = tab_bar.tabAt(pos)
+        if index < 0:
+            return
+        menu = QMenu(self)
+        rename_action = menu.addAction("プロジェクト名を編集")
+        delete_action = menu.addAction("プロジェクトを削除")
+        action = menu.exec_(tab_bar.mapToGlobal(pos))
+        if action == rename_action:
+            self.rename_project(index)
+        elif action == delete_action:
+            self.delete_project(index)
+
+    def rename_project(self, index):
+        tab = self.tab_widget.widget(index)
+        if not isinstance(tab, ProjectTab):
+            return
+        old_name = tab.project_data.get(
+            "name", self.tab_widget.tabText(index))
+        new_name, ok = QInputDialog.getText(
+            self, "プロジェクト名を編集", "新しいプロジェクト名:",
+            text=old_name)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == old_name:
+            return
+
+        invalid_chars = '<>:"/\\|?*'
+        reserved_names = {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)),
+            *(f"LPT{i}" for i in range(1, 10)),
+        }
+        if (any(char in new_name for char in invalid_chars)
+                or new_name.endswith((".", " "))
+                or new_name.split(".", 1)[0].upper() in reserved_names):
+            QMessageBox.warning(
+                self, "名前エラー",
+                "プロジェクト名にファイル名として使用できない文字が含まれています。")
+            return
+        if new_name in self.project_tabs:
+            QMessageBox.warning(
+                self, "名前エラー",
+                f"プロジェクト「{new_name}」は既に存在します。")
+            return
+
+        old_path = os.path.abspath(
+            tab.source_path or os.path.join(
+                USER_DATA_DIR, f"{old_name}.json"))
+        new_path = os.path.join(
+            os.path.dirname(old_path), f"{new_name}.json")
+        same_path = os.path.normcase(old_path) == os.path.normcase(new_path)
+        if not same_path and os.path.exists(new_path):
+            QMessageBox.warning(
+                self, "名前エラー",
+                f"同名のプロジェクトファイルが既に存在します:\n{new_path}")
+            return
+
+        moved = False
+        try:
+            if os.path.isfile(old_path) and old_path != new_path:
+                os.rename(old_path, new_path)
+                moved = True
+            tab.project_data["name"] = new_name
+            with open(new_path, "w", encoding="utf-8") as f:
+                json.dump(tab.project_data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            tab.project_data["name"] = old_name
+            if moved and os.path.exists(new_path) and not os.path.exists(old_path):
+                try:
+                    os.rename(new_path, old_path)
+                except Exception:
+                    pass
+            QMessageBox.warning(
+                self, "名前変更エラー",
+                f"プロジェクト名を変更できませんでした:\n\n{e}")
+            return
+
+        tab.source_path = new_path
+        tab.proj = new_name
+        if self.project_tabs.get(old_name) is tab:
+            self.project_tabs.pop(old_name, None)
+        self.project_tabs[new_name] = tab
+        self.tab_widget.setTabText(index, new_name)
+        self.save_workspace()
+
+    def delete_project(self, index):
+        tab = self.tab_widget.widget(index)
+        if not isinstance(tab, ProjectTab):
+            return
+        name = tab.project_data.get("name", self.tab_widget.tabText(index))
+        answer = QMessageBox.question(
+            self,
+            "プロジェクトの削除",
+            f"本当にプロジェクト「{name}」を削除しますか？\n"
+            "この操作は元に戻せません。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        json_path = tab.source_path or os.path.join(
+            USER_DATA_DIR, f"{name}.json")
+        try:
+            if os.path.isfile(json_path):
+                os.remove(json_path)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "削除エラー",
+                f"プロジェクトファイルを削除できませんでした:\n{json_path}\n\n{e}")
+            return
+
+        self.tab_widget.removeTab(index)
+        if self.project_tabs.get(name) is tab:
+            self.project_tabs.pop(name, None)
+        tab.deleteLater()
+        self.save_workspace()
 
     def add_new_project(self):
         name, ok = QInputDialog.getText(self, "プロジェクト名", "プロジェクト名を入力:")
