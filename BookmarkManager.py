@@ -22,7 +22,8 @@ if maya_version >= 2025:
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
-        QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider
+        QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
+        QSizePolicy
     )
     from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag
     from PySide6.QtCore import Qt, QSize, QFileInfo, QMimeData
@@ -32,7 +33,8 @@ else:
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
-        QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider
+        QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
+        QSizePolicy
     )
     from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag
     from PySide2.QtCore import Qt, QSize, QFileInfo, QMimeData
@@ -492,7 +494,10 @@ class ConfigurableButton(QPushButton):
         self.button_index = button_index
         self.update_callback = update_callback
         self.drag_start_pos = None
-        self.setFixedSize(80, 32)
+        # 高さは固定、幅は可変（ウィンドウを縮めたときにボタンも縮む）
+        self.setFixedHeight(32)
+        self.setMinimumWidth(36)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setAcceptDrops(True)
         # 枠線とホバーは共通スタイルに任せ、内側パディングだけ詰めてアイコン領域を確保
         self.setStyleSheet("ConfigurableButton { padding: 1px; }")
@@ -518,7 +523,8 @@ class ConfigurableButton(QPushButton):
             except (ValueError, OSError):
                 pass
         self.setIcon(icon)
-        self.setIconSize(QSize(20 if label else 26, 20 if label else 26))
+        # 枠線＋パディング分を差し引いてボタン内に収める（溢れ防止）
+        self.setIconSize(QSize(20 if label else 22, 20 if label else 22))
         self.setText(label or "")
         self.current_label = label
 
