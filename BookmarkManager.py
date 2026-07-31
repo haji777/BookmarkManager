@@ -6,6 +6,8 @@ import subprocess
 import shlex
 import getpass
 import configparser
+import ctypes
+import shutil
 
 # Check if a version argument is provided
 if len(sys.argv) > 1:
@@ -23,9 +25,9 @@ if maya_version >= 2025:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel
     )
-    from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag
+    from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
     from PySide6.QtCore import Qt, QSize, QFileInfo, QMimeData
 else:
     from PySide2.QtWidgets import (
@@ -34,9 +36,9 @@ else:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel
     )
-    from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag
+    from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
     from PySide2.QtCore import Qt, QSize, QFileInfo, QMimeData
 
 
@@ -811,6 +813,8 @@ class BookmarkTableWidget(QTableWidget):
         name, path, color = self.row_data(row)
 
         menu = QMenu(self)
+        open_explorer_action = menu.addAction("エクスプローラで開く")
+        menu.addSeparator()
         rename_action = menu.addAction("ブックマーク名の変更")
         color_action = menu.addAction("色の設定")
         clear_color_action = menu.addAction("色をクリア")
@@ -820,7 +824,17 @@ class BookmarkTableWidget(QTableWidget):
 
         action = menu.exec_(self.viewport().mapToGlobal(pos))
 
-        if action == rename_action:
+        if action == open_explorer_action:
+            try:
+                self.parent_tab.update_label()
+                resolved = resolve_path(path, self.parent_tab)
+                if os.path.exists(resolved):
+                    reveal_in_explorer(resolved)
+                else:
+                    QMessageBox.warning(self, "エラー", "フォルダが見つかりません: " + resolved)
+            except Exception as e:
+                QMessageBox.warning(self, "エラー", f"予期しないエラー: {e}")
+        elif action == rename_action:
             new_name, ok = QInputDialog.getText(self, "名前の変更", "新しい名前:", text=name)
             if ok and new_name:
                 self._set_row(row, new_name, path, color)
@@ -856,13 +870,14 @@ class BookmarkTableWidget(QTableWidget):
 # ============================================================
 class ProjectTab(QWidget):
     def __init__(self, project_data, add_project_callback, open_settings_callback,
-                 source_path=None):
+                 source_path=None, show_in_explorer_callback=None):
         super().__init__()
         self.initializing = True
         self.sort_ascending = True
         self.project_data = project_data
         self.add_project_callback = add_project_callback
         self.open_settings_callback = open_settings_callback
+        self.show_in_explorer_callback = show_in_explorer_callback
         self.source_path = source_path  # 読み込み元（共有プロジェクト用）
 
         self.proj = project_data.get("name", "blank_project")
@@ -1088,7 +1103,10 @@ class ProjectTab(QWidget):
             self.update_label()
             resolved = resolve_path(path, self)
             if os.path.exists(resolved):
-                os.startfile(resolved)
+                if self.show_in_explorer_callback:
+                    self.show_in_explorer_callback(resolved)
+                else:
+                    os.startfile(resolved)
             else:
                 QMessageBox.warning(self, "エラー", "フォルダが見つかりません: " + resolved)
         except Exception as e:
@@ -1185,6 +1203,505 @@ def load_workspace():
     return {}
 
 
+# ============================================================
+#  Windows シェル操作ヘルパー
+# ============================================================
+def copy_path_forward_slash(path):
+    """パスを / 区切りにしてクリップボードへ"""
+    text = os.path.normpath(path).replace("\\", "/")
+    cb = QApplication.clipboard()
+    if cb:
+        cb.setText(text)
+    return text
+
+
+def reveal_in_explorer(path):
+    """フォルダはそのまま開く。ファイルは選択状態でエクスプローラを開く。"""
+    path = os.path.normpath(path)
+    if os.path.isdir(path):
+        os.startfile(path)
+    else:
+        subprocess.Popen(f'explorer /select,"{path}"')
+
+
+def open_with_dialog(path):
+    """Windows の「プログラムから開く」ダイアログ"""
+    subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL",
+                      os.path.normpath(path)])
+
+
+def get_sendto_dir():
+    appdata = os.environ.get("APPDATA", "")
+    return os.path.join(appdata, "Microsoft", "Windows", "SendTo") if appdata else ""
+
+
+def run_sendto(link_path, target_path):
+    """SendTo のショートカット等に対象ファイルを渡して実行"""
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "open", link_path, f'"{os.path.normpath(target_path)}"', None, 1)
+
+
+def _sendkeys_escape(text):
+    out = []
+    for ch in text:
+        out.append("{" + ch + "}" if ch in "+^%~(){}[]" else ch)
+    return "".join(out)
+
+
+def open_terminal(dir_path, file_path=None):
+    """dir_path に移動したターミナルを開く。file_path があればその名前を入力欄に書き込む。"""
+    dir_path = os.path.normpath(dir_path)
+    ps_dir = dir_path.replace("'", "''")
+    if not file_path:
+        script = f"Start-Process -FilePath cmd.exe -ArgumentList '/K','cd /d \"{ps_dir}\"'"
+    else:
+        keys = _sendkeys_escape('"' + os.path.normpath(file_path) + '"').replace("'", "''")
+        script = (
+            f"$p = Start-Process -FilePath cmd.exe -ArgumentList '/K','cd /d \"{ps_dir}\"' -PassThru; "
+            "Start-Sleep -Milliseconds 350; "
+            "$w = New-Object -ComObject WScript.Shell; "
+            "[void]$w.AppActivate($p.Id); "
+            "Start-Sleep -Milliseconds 120; "
+            f"[void]$w.SendKeys('{keys}')"
+        )
+    subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                      "-Command", script])
+
+
+def show_properties(path):
+    """Windows のプロパティダイアログ"""
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_INVOKEIDLIST = 0x0000000C
+    sei = SHELLEXECUTEINFO()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_INVOKEIDLIST
+    sei.lpVerb = "properties"
+    sei.lpFile = os.path.normpath(path)
+    sei.nShow = 1
+    ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
+
+
+def unique_path(dir_path, base_name):
+    """dir_path 内で衝突しない名前を返す"""
+    candidate = os.path.join(dir_path, base_name)
+    if not os.path.exists(candidate):
+        return candidate
+    root, ext = os.path.splitext(base_name)
+    i = 2
+    while True:
+        candidate = os.path.join(dir_path, f"{root} ({i}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
+FO_MOVE, FO_COPY, FO_DELETE = 1, 2, 3
+FOF_ALLOWUNDO = 0x0040
+FOF_NOCONFIRMATION = 0x0010
+
+
+def _sh_file_operation(func, sources, dest, flags):
+    """SHFileOperation ラッパ（ネイティブのコピー/移動/ごみ箱送り）"""
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = func
+    op.pFrom = "\0".join(os.path.normpath(p) for p in sources) + "\0\0"
+    if dest:
+        op.pTo = os.path.normpath(dest) + "\0\0"
+    op.fFlags = flags
+    res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return res == 0 and not op.fAnyOperationsAborted
+
+
+def send_to_recycle_bin(paths):
+    """ファイル/フォルダをごみ箱へ移動（完全削除ではなく復元可能）"""
+    return _sh_file_operation(FO_DELETE, paths, None,
+                              FOF_ALLOWUNDO | FOF_NOCONFIRMATION)
+
+
+def shell_copy_move(sources, dest_dir, move=False):
+    """dest_dir へネイティブコピー/移動（進捗・衝突ダイアログはWindows任せ）"""
+    return _sh_file_operation(FO_MOVE if move else FO_COPY, sources, dest_dir,
+                              FOF_ALLOWUNDO)
+
+
+ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz",
+                ".bz2", ".xz", ".lzh", ".cab", ".iso"}
+
+
+def is_archive(path):
+    return os.path.isfile(path) and os.path.splitext(path)[1].lower() in ARCHIVE_EXTS
+
+
+def find_7zip():
+    for p in (r"C:\Program Files\7-Zip\7z.exe",
+              r"C:\Program Files (x86)\7-Zip\7z.exe"):
+        if os.path.exists(p):
+            return p
+    return shutil.which("7z") or shutil.which("7za")
+
+
+def extract_archive_here(archive_path):
+    """アーカイブと同じ場所に、アーカイブ名のフォルダを作って展開する"""
+    d = os.path.dirname(archive_path)
+    name = os.path.basename(archive_path)
+    if name.lower().endswith(".tar.gz"):
+        base = name[:-7]
+    else:
+        base = os.path.splitext(name)[0]
+    dest = unique_path(d, base)
+    os.makedirs(dest, exist_ok=True)
+    ext = os.path.splitext(archive_path)[1].lower()
+    try:
+        if ext == ".zip":
+            import zipfile
+            with zipfile.ZipFile(archive_path) as z:
+                z.extractall(dest)
+        elif ext in (".tar", ".gz", ".tgz", ".bz2", ".xz"):
+            import tarfile
+            with tarfile.open(archive_path) as t:
+                t.extractall(dest)
+        else:  # .7z .rar .lzh .cab .iso など → 7-Zip
+            seven = find_7zip()
+            if not seven:
+                raise RuntimeError("この形式の解凍には 7-Zip が必要です")
+            subprocess.run([seven, "x", "-y", f"-o{dest}", archive_path], check=True)
+    except Exception:
+        try:  # 失敗時は空フォルダを掃除
+            if os.path.isdir(dest) and not os.listdir(dest):
+                os.rmdir(dest)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+class _FileTreeView(QTreeView):
+    """Deleteキー削除 + 外部ファイルのドロップ（コピー/移動）に対応したツリービュー"""
+    def __init__(self, panel):
+        super().__init__()
+        self.panel = panel
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            self.panel.delete_selected()
+        else:
+            super().keyPressEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        index = self.indexAt(pos)
+        if index.isValid():
+            p = self.panel.model.filePath(index)
+            dest = p if os.path.isdir(p) else os.path.dirname(p)
+        else:
+            dest = self.panel.current_root
+        sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        sources = [s for s in sources if s]
+        if sources and dest:
+            self.panel.handle_external_drop(sources, dest)
+        event.acceptProposedAction()
+
+
+class ExplorerPanel(QWidget):
+    """右側に埋め込むファイルブラウザ（名前/サイズ/種類/更新日時）"""
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # 上部バー: 上へ / パス / OSで開く / 閉じる
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        self.up_button = QToolButton()
+        self.up_button.setText("↑")
+        self.up_button.setToolTip("上のフォルダへ")
+        self.up_button.setFixedSize(26, 24)
+        self.path_edit = QLineEdit()
+        self.path_edit.setReadOnly(True)
+        self.open_os_button = QToolButton()
+        self.open_os_button.setText("⧉")
+        self.open_os_button.setToolTip("エクスプローラで開く")
+        self.open_os_button.setFixedSize(26, 24)
+        self.close_button = QToolButton()
+        self.close_button.setText("✕")
+        self.close_button.setToolTip("パネルを閉じる")
+        self.close_button.setFixedSize(26, 24)
+        bar.addWidget(self.up_button)
+        bar.addWidget(self.path_edit)
+        bar.addWidget(self.open_os_button)
+        bar.addWidget(self.close_button)
+        layout.addLayout(bar)
+
+        # ファイルツリー
+        self.model = QFileSystemModel()
+        self.model.setRootPath("")
+        self.tree = _FileTreeView(self)
+        self.tree.setModel(self.model)
+        self.tree.setSortingEnabled(True)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # 外部（エクスプローラ）からのドロップを受け付ける
+        self.tree.setAcceptDrops(True)
+        self.tree.setDragEnabled(False)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDragDropMode(QAbstractItemView.DropOnly)
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, self.model.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        # 列順を Windows エクスプローラ風に: 名前 / 更新日時 / 種類 / サイズ
+        header.moveSection(3, 1)  # 更新日時(logical 3) を名前の右へ
+        header.moveSection(3, 2)  # 種類(logical 2) をその右へ
+        self.tree.doubleClicked.connect(self._on_double_clicked)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.open_context_menu)
+        layout.addWidget(self.tree)
+
+        self.current_root = ""
+        self.up_button.clicked.connect(self.go_up)
+        self.open_os_button.clicked.connect(self.open_in_os)
+        # close_button は ProjectManager 側で接続
+
+    def set_root(self, path):
+        self.current_root = path
+        idx = self.model.setRootPath(path)
+        self.tree.setRootIndex(idx)
+        self.path_edit.setText(os.path.normpath(path))
+        self.tree.scrollToTop()
+
+    def go_up(self):
+        if not self.current_root:
+            return
+        parent = os.path.dirname(os.path.normpath(self.current_root))
+        if parent and os.path.isdir(parent) and parent != self.current_root:
+            self.set_root(parent)
+
+    def open_in_os(self):
+        if self.current_root and os.path.exists(self.current_root):
+            os.startfile(self.current_root)
+
+    def _on_double_clicked(self, index):
+        path = self.model.filePath(index)
+        if os.path.isdir(path):
+            self.set_root(path)          # フォルダは中へ潜る
+        elif os.path.exists(path):
+            try:
+                os.startfile(path)        # ファイルは起動
+            except Exception as e:
+                QMessageBox.warning(self, "エラー", f"開けませんでした: {e}")
+
+    def selected_paths(self):
+        seen, out = set(), []
+        for idx in self.tree.selectedIndexes():
+            if idx.column() != 0:
+                continue
+            p = self.model.filePath(idx)
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def delete_selected(self):
+        paths = self.selected_paths()
+        if not paths:
+            return
+        if len(paths) == 1:
+            msg = "次の項目をごみ箱へ移動しますか？\n\n" + os.path.normpath(paths[0])
+        else:
+            msg = f"{len(paths)} 個の項目をごみ箱へ移動しますか？"
+        reply = QMessageBox.question(
+            self, "削除の確認", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            if not send_to_recycle_bin(paths):
+                QMessageBox.warning(self, "エラー", "削除に失敗しました。")
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"削除に失敗しました: {e}")
+
+    def handle_external_drop(self, sources, dest_dir):
+        """エクスプローラからのドロップ時に コピー/移動 を選ばせる"""
+        menu = QMenu(self)
+        a_copy = menu.addAction("ここにコピー")
+        a_move = menu.addAction("ここに移動")
+        menu.addSeparator()
+        menu.addAction("キャンセル")
+        chosen = menu.exec_(QCursor.pos())
+        try:
+            if chosen == a_copy:
+                shell_copy_move(sources, dest_dir, move=False)
+            elif chosen == a_move:
+                shell_copy_move(sources, dest_dir, move=True)
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
+
+    # ---------- 右クリックメニュー ----------
+    def open_context_menu(self, pos):
+        index = self.tree.indexAt(pos)
+        # 未選択の項目を右クリックしたらその項目を選択（複数選択中はそのまま）
+        if index.isValid() and not self.tree.selectionModel().isSelected(index):
+            self.tree.setCurrentIndex(index)
+        item_path = self.model.filePath(index) if index.isValid() else ""
+        is_item = bool(item_path)
+        is_dir = os.path.isdir(item_path) if is_item else True
+        target = item_path if is_item else self.current_root
+        if not target:
+            return
+
+        menu = QMenu(self)
+        act_rename = act_openwith = act_extract = None
+        sendto_actions = {}
+
+        if is_item:
+            act_rename = menu.addAction("名前を変更")
+            if not is_dir:
+                act_openwith = menu.addAction("プログラムから開く")
+            if is_archive(item_path):
+                act_extract = menu.addAction("その場で解凍")
+            send_menu = menu.addMenu("送る")
+            sendto_dir = get_sendto_dir()
+            entries = []
+            if sendto_dir and os.path.isdir(sendto_dir):
+                entries = sorted(n for n in os.listdir(sendto_dir)
+                                 if n.lower() != "desktop.ini")
+            if entries:
+                icon_provider = QFileIconProvider()
+                for name in entries:
+                    label = os.path.splitext(name)[0]
+                    full = os.path.join(sendto_dir, name)
+                    a = send_menu.addAction(label)
+                    ic = icon_provider.icon(QFileInfo(full))
+                    if not ic.isNull():
+                        a.setIcon(ic)
+                    sendto_actions[a] = full
+            else:
+                send_menu.setEnabled(False)
+            menu.addSeparator()
+
+        act_copy = menu.addAction("パスをコピー")
+        act_explorer = menu.addAction("エクスプローラで開く")
+        act_terminal = menu.addAction("ターミナルで開く")
+        menu.addSeparator()
+        act_newfolder = menu.addAction("フォルダを作成")
+        act_newtext = menu.addAction("テキストを作成")
+        menu.addSeparator()
+        act_delete = menu.addAction("削除") if is_item else None
+        if is_item:
+            menu.addSeparator()
+        act_props = menu.addAction("プロパティ")
+
+        action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+
+        try:
+            if action == act_rename:
+                self._rename(item_path)
+            elif action is not None and action == act_openwith:
+                open_with_dialog(item_path)
+            elif act_extract is not None and action == act_extract:
+                extract_archive_here(item_path)
+            elif action in sendto_actions:
+                run_sendto(sendto_actions[action], item_path)
+            elif action == act_copy:
+                copy_path_forward_slash(target)
+            elif action == act_explorer:
+                reveal_in_explorer(target)
+            elif action == act_terminal:
+                if is_item and not is_dir:
+                    open_terminal(os.path.dirname(item_path), item_path)
+                else:
+                    open_terminal(target)
+            elif action == act_newfolder:
+                self._create_new("フォルダ")
+            elif action == act_newtext:
+                self._create_new("テキスト")
+            elif act_delete is not None and action == act_delete:
+                self.delete_selected()
+            elif action == act_props:
+                show_properties(target)
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
+
+    def _rename(self, path):
+        old = os.path.basename(os.path.normpath(path))
+        new, ok = QInputDialog.getText(self, "名前を変更", "新しい名前:", text=old)
+        if ok and new and new != old:
+            os.rename(path, os.path.join(os.path.dirname(path), new))
+
+    def _create_new(self, kind):
+        base_dir = self.current_root
+        if not os.path.isdir(base_dir):
+            return
+        if kind == "フォルダ":
+            default = "新しいフォルダ"
+            new, ok = QInputDialog.getText(self, "フォルダを作成", "フォルダ名:", text=default)
+            if ok and new:
+                os.makedirs(unique_path(base_dir, new), exist_ok=False)
+        else:
+            default = "新しいテキスト.txt"
+            new, ok = QInputDialog.getText(self, "テキストを作成", "ファイル名:", text=default)
+            if ok and new:
+                if not os.path.splitext(new)[1]:
+                    new += ".txt"
+                open(unique_path(base_dir, new), "w", encoding="utf-8").close()
+
+
 class ProjectManager(QWidget):
     def __init__(self):
         super().__init__()
@@ -1202,7 +1719,18 @@ class ProjectManager(QWidget):
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tab_widget.tabBar().customContextMenuRequested.connect(
             self.open_project_context_menu)
-        self.layout.addWidget(self.tab_widget)
+
+        # 左=ブックマーク、右=埋め込みエクスプローラ（初期は非表示で省スペース）
+        self.explorer = ExplorerPanel()
+        self.explorer.close_button.clicked.connect(self.hide_explorer)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.tab_widget)
+        self.splitter.addWidget(self.explorer)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.explorer.hide()
+        self.layout.addWidget(self.splitter)
 
         # 前回のタブ順・選択タブを復元
         ws = load_workspace()
@@ -1231,11 +1759,38 @@ class ProjectManager(QWidget):
 
     def _add_tab(self, data, source_path):
         tab = ProjectTab(data, self.add_new_project, self.open_settings,
-                         source_path=source_path)
+                         source_path=source_path,
+                         show_in_explorer_callback=self.show_in_explorer)
         name = data.get("name", "Unnamed")
         self.tab_widget.addTab(tab, name)
         self.project_tabs[name] = tab
         return tab
+
+    def show_in_explorer(self, resolved_path):
+        """ブックマークのダブルクリックで右側パネルにフォルダを表示"""
+        if os.path.isdir(resolved_path):
+            was_hidden = self.explorer.isHidden()
+            self.explorer.setVisible(True)
+            self.explorer.set_root(resolved_path)
+            if was_hidden:
+                # 初回表示時はパネル分だけウィンドウを広げる
+                extra = 480
+                self.resize(self.width() + extra, max(self.height(), 500))
+                left = max(self.tab_widget.width(), 260)
+                self.splitter.setSizes([left, extra])
+        else:
+            # フォルダでなければ従来どおりOSで開く
+            try:
+                os.startfile(resolved_path)
+            except Exception as e:
+                QMessageBox.warning(self, "エラー", f"開けませんでした: {e}")
+
+    def hide_explorer(self):
+        if not self.explorer.isHidden():
+            w = self.explorer.width()
+            self.explorer.hide()
+            # パネル分だけウィンドウを縮める
+            self.resize(max(self.width() - w, 260), self.height())
 
     def _on_workspace_changed(self, *args):
         if not self._loading:
