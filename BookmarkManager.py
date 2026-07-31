@@ -778,14 +778,20 @@ class BookmarkTableWidget(QTableWidget):
             self.parent_tab.commit_bookmarks()
             event.acceptProposedAction()
         elif event.mimeData().hasUrls():
-            # --- 外部ファイル/フォルダ追加 ---
+            # --- 外部/ファイルブラウザからのドロップでブックマーク追加 ---
+            added = False
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
                 if path and os.path.exists(path):
                     name = os.path.basename(os.path.normpath(path))
-                    self.append_row(name, path)
-            self.parent_tab.commit_bookmarks()
-            event.acceptProposedAction()
+                    stored = os.path.normpath(path).replace("\\", "/")
+                    self.append_row(name, stored)
+                    added = True
+            if added:
+                self.parent_tab.commit_bookmarks()
+            # コピー扱いにして、ドラッグ元のファイルが移動・削除されないようにする
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
         else:
             event.ignore()
 
@@ -1083,6 +1089,16 @@ class ProjectTab(QWidget):
         if not ok or not name:
             return
         self.table.append_row(name, folder)
+        self.commit_bookmarks()
+
+    def add_bookmark_for(self, path):
+        """指定パスをブックマークに追加（ファイルブラウザからの登録用）"""
+        stored = os.path.normpath(path).replace("\\", "/")
+        default = os.path.basename(os.path.normpath(path)) or stored
+        name, ok = QInputDialog.getText(self, "ブックマーク名", "名前を入力:", text=default)
+        if not ok or not name:
+            return
+        self.table.append_row(name, stored)
         self.commit_bookmarks()
 
     def sort_bookmarks(self):
@@ -1421,6 +1437,11 @@ class _FileTreeView(QTreeView):
         else:
             super().keyPressEvent(event)
 
+    def startDrag(self, supportedActions):
+        # ツリーからのドラッグは必ずコピー扱いにする
+        # （移動扱いだとドロップ成功後に元ファイルが削除されうるため）
+        super().startDrag(Qt.CopyAction)
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -1494,11 +1515,13 @@ class ExplorerPanel(QWidget):
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        # 外部（エクスプローラ）からのドロップを受け付ける
+        # 外部からのドロップを受け付け、かつ自身もドラッグ元にする
+        # （ブックマーク表へドラッグして登録できるように）
         self.tree.setAcceptDrops(True)
-        self.tree.setDragEnabled(False)
+        self.tree.setDragEnabled(True)
         self.tree.setDropIndicatorShown(True)
-        self.tree.setDragDropMode(QAbstractItemView.DropOnly)
+        self.tree.setDragDropMode(QAbstractItemView.DragDrop)
+        self.tree.setDefaultDropAction(Qt.CopyAction)
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         for col in range(1, self.model.columnCount()):
@@ -1512,6 +1535,7 @@ class ExplorerPanel(QWidget):
         layout.addWidget(self.tree)
 
         self.current_root = ""
+        self.add_bookmark_callback = None  # ProjectManager 側で設定
         self.up_button.clicked.connect(self.go_up)
         self.open_os_button.clicked.connect(self.open_in_os)
         # close_button は ProjectManager 側で接続
@@ -1633,6 +1657,8 @@ class ExplorerPanel(QWidget):
                 send_menu.setEnabled(False)
             menu.addSeparator()
 
+        act_bookmark = menu.addAction("ブックマークに追加")
+        menu.addSeparator()
         act_copy = menu.addAction("パスをコピー")
         act_explorer = menu.addAction("エクスプローラで開く")
         act_terminal = menu.addAction("ターミナルで開く")
@@ -1658,6 +1684,9 @@ class ExplorerPanel(QWidget):
                 extract_archive_here(item_path)
             elif action in sendto_actions:
                 run_sendto(sendto_actions[action], item_path)
+            elif action == act_bookmark:
+                if self.add_bookmark_callback:
+                    self.add_bookmark_callback(target)
             elif action == act_copy:
                 copy_path_forward_slash(target)
             elif action == act_explorer:
@@ -1723,6 +1752,7 @@ class ProjectManager(QWidget):
         # 左=ブックマーク、右=埋め込みエクスプローラ（初期は非表示で省スペース）
         self.explorer = ExplorerPanel()
         self.explorer.close_button.clicked.connect(self.hide_explorer)
+        self.explorer.add_bookmark_callback = self.add_bookmark_from_path
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self.tab_widget)
         self.splitter.addWidget(self.explorer)
@@ -1791,6 +1821,14 @@ class ProjectManager(QWidget):
             self.explorer.hide()
             # パネル分だけウィンドウを縮める
             self.resize(max(self.width() - w, 260), self.height())
+
+    def add_bookmark_from_path(self, path):
+        """ファイルブラウザから現在のプロジェクトタブへブックマーク登録"""
+        tab = self.tab_widget.currentWidget()
+        if isinstance(tab, ProjectTab):
+            tab.add_bookmark_for(path)
+        else:
+            QMessageBox.warning(self, "エラー", "追加先のプロジェクトタブがありません。")
 
     def _on_workspace_changed(self, *args):
         if not self._loading:
