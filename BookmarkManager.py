@@ -8,6 +8,8 @@ import getpass
 import configparser
 import ctypes
 import shutil
+import re
+import time
 
 # Check if a version argument is provided
 if len(sys.argv) > 1:
@@ -25,10 +27,13 @@ if maya_version >= 2025:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy, QTreeView, QSplitter, QFileSystemModel
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox
     )
     from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
-    from PySide6.QtCore import Qt, QSize, QFileInfo, QMimeData
+    from PySide6.QtCore import (
+        Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
+        QAbstractTableModel, QFileSystemWatcher
+    )
 else:
     from PySide2.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView,
@@ -36,10 +41,13 @@ else:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy, QTreeView, QSplitter, QFileSystemModel
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox
     )
     from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
-    from PySide2.QtCore import Qt, QSize, QFileInfo, QMimeData
+    from PySide2.QtCore import (
+        Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
+        QAbstractTableModel, QFileSystemWatcher
+    )
 
 
 # --- アプリ本体とユーザーデータを分離する ---
@@ -777,6 +785,9 @@ class BookmarkTableWidget(QTableWidget):
                 self.selectRow(drop_row + i)
             self.parent_tab.commit_bookmarks()
             event.acceptProposedAction()
+        elif event.mimeData().hasFormat(SEQ_MIME):
+            # 連番のまとめ行はブックマーク登録禁止
+            event.ignore()
         elif event.mimeData().hasUrls():
             # --- 外部/ファイルブラウザからのドロップでブックマーク追加 ---
             added = False
@@ -1462,7 +1473,7 @@ class _FileTreeView(QTreeView):
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
         index = self.indexAt(pos)
         if index.isValid():
-            p = self.panel.model.filePath(index)
+            p = self.panel.model.path_at(index)
             dest = p if os.path.isdir(p) else os.path.dirname(p)
         else:
             dest = self.panel.current_root
@@ -1473,8 +1484,260 @@ class _FileTreeView(QTreeView):
         event.acceptProposedAction()
 
 
+# ============================================================
+#  連番まとめ対応のディレクトリモデル
+# ============================================================
+# name.0179.exr / name_0179.exr 形式（.数字.ext または _数字.ext）
+SEQ_RE = re.compile(r"^(.*)([._])(\d+)(\.[^.]+)$")
+
+# 連番のまとめ行をブックマーク表へドロップさせないための目印
+SEQ_MIME = "application/x-bookmarkmanager-seq"
+
+
+def human_size(n):
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    f = float(n)
+    i = 0
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024
+        i += 1
+    return f"{int(f)} B" if i == 0 else f"{f:.1f} {units[i]}"
+
+
+def format_mtime(mtime):
+    return time.strftime("%Y/%m/%d %H:%M", time.localtime(mtime))
+
+
+class _Entry:
+    __slots__ = ("display", "paths", "is_dir", "is_seq", "size", "mtime",
+                 "sort_name", "ext")
+
+    def __init__(self, display, paths, is_dir, is_seq, size, mtime, sort_name, ext):
+        self.display = display
+        self.paths = paths
+        self.is_dir = is_dir
+        self.is_seq = is_seq
+        self.size = size
+        self.mtime = mtime
+        self.sort_name = sort_name
+        self.ext = ext
+
+
+class SeqFileModel(QAbstractTableModel):
+    """カレントディレクトリを表示。seq有効時は連番を1行にまとめる。"""
+    HEADERS = ["名前", "サイズ", "種類", "更新日時"]
+    COL_NAME, COL_SIZE, COL_TYPE, COL_MTIME = 0, 1, 2, 3
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dir = ""
+        self._entries = []
+        self._seq_enabled = True
+        self._icon_provider = QFileIconProvider()
+        self._icon_cache = {}
+        self._type_cache = {}
+        self._sort_col = 0
+        self._sort_order = Qt.AscendingOrder
+
+    # ---- 設定 ----
+    def set_seq_enabled(self, on):
+        if self._seq_enabled != bool(on):
+            self._seq_enabled = bool(on)
+            self.reload()
+
+    def set_directory(self, path):
+        self._dir = path
+        self.reload()
+
+    def reload(self):
+        self.beginResetModel()
+        self._entries = self._scan()
+        self._apply_sort()
+        self.endResetModel()
+
+    # ---- 走査 ----
+    def _scan(self):
+        d = self._dir
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return []
+        dirs, files = [], []
+        for n in names:
+            full = os.path.join(d, n)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if os.path.isdir(full):
+                dirs.append(_Entry(n, [full], True, False, 0, st.st_mtime, n.lower(), ""))
+            else:
+                files.append((n, full, st))
+
+        file_entries = []
+        if self._seq_enabled:
+            groups, singles = {}, []
+            for n, full, st in files:
+                m = SEQ_RE.match(n)
+                if m:
+                    prefix, sep, frame, ext = m.groups()
+                    groups.setdefault((prefix, sep, ext, len(frame)), []).append(
+                        (int(frame), full, st))
+                else:
+                    singles.append((n, full, st))
+            for (prefix, sep, ext, pad), members in groups.items():
+                if len(members) >= 2:
+                    members.sort(key=lambda x: x[0])
+                    frames = [mm[0] for mm in members]
+                    paths = [mm[1] for mm in members]
+                    total = sum(mm[2].st_size for mm in members)
+                    mtime = max(mm[2].st_mtime for mm in members)
+                    disp = f"{prefix}{sep}{'#' * pad}{ext} {frames[0]}-{frames[-1]}"
+                    file_entries.append(_Entry(
+                        disp, paths, False, True, total, mtime,
+                        (prefix + sep + ext).lower(), ext.lower()))
+                else:
+                    _, full, st = members[0]
+                    n = os.path.basename(full)
+                    file_entries.append(_Entry(
+                        n, [full], False, False, st.st_size, st.st_mtime,
+                        n.lower(), os.path.splitext(n)[1].lower()))
+            for n, full, st in singles:
+                file_entries.append(_Entry(
+                    n, [full], False, False, st.st_size, st.st_mtime,
+                    n.lower(), os.path.splitext(n)[1].lower()))
+        else:
+            for n, full, st in files:
+                file_entries.append(_Entry(
+                    n, [full], False, False, st.st_size, st.st_mtime,
+                    n.lower(), os.path.splitext(n)[1].lower()))
+        return dirs + file_entries
+
+    def _apply_sort(self):
+        col, rev = self._sort_col, (self._sort_order == Qt.DescendingOrder)
+
+        def key(e):
+            if col == self.COL_SIZE:
+                return e.size
+            if col == self.COL_MTIME:
+                return e.mtime
+            if col == self.COL_TYPE:
+                return self._type_for(e).lower()
+            return e.sort_name
+
+        dirs = [e for e in self._entries if e.is_dir]
+        files = [e for e in self._entries if not e.is_dir]
+        dirs.sort(key=lambda e: e.sort_name, reverse=rev)
+        files.sort(key=key, reverse=rev)
+        self._entries = dirs + files
+
+    # ---- QAbstractTableModel ----
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._entries)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.HEADERS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        e = self._entries[index.row()]
+        col = index.column()
+        if role == Qt.DisplayRole:
+            if col == self.COL_NAME:
+                return e.display
+            if col == self.COL_SIZE:
+                return "" if e.is_dir else human_size(e.size)
+            if col == self.COL_TYPE:
+                return self._type_for(e)
+            if col == self.COL_MTIME:
+                return format_mtime(e.mtime)
+        elif role == Qt.DecorationRole and col == self.COL_NAME:
+            return self._icon_for(e)
+        elif role == Qt.TextAlignmentRole and col == self.COL_SIZE:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        return None
+
+    def flags(self, index):
+        base = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        if index.isValid():
+            base |= Qt.ItemIsDragEnabled
+        return base
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        self._sort_col = column
+        self._sort_order = order
+        self.beginResetModel()
+        self._apply_sort()
+        self.endResetModel()
+
+    def mimeTypes(self):
+        return ["text/uri-list"]
+
+    def supportedDragActions(self):
+        return Qt.CopyAction
+
+    def mimeData(self, indexes):
+        urls, seen = [], set()
+        has_seq = False
+        for idx in indexes:
+            if idx.column() != 0:
+                continue
+            e = self._entries[idx.row()]
+            if e.is_seq:
+                has_seq = True
+            for p in e.paths:
+                if p not in seen:
+                    seen.add(p)
+                    urls.append(QUrl.fromLocalFile(p))
+        md = QMimeData()
+        md.setUrls(urls)
+        if has_seq:
+            # 連番はブックマーク登録禁止の目印
+            md.setData(SEQ_MIME, b"1")
+        return md
+
+    def _icon_for(self, e):
+        key = "<dir>" if e.is_dir else (e.ext or "<file>")
+        ic = self._icon_cache.get(key)
+        if ic is None:
+            if e.is_dir:
+                ic = self._icon_provider.icon(QFileIconProvider.Folder)
+            else:
+                ic = self._icon_provider.icon(QFileInfo(e.paths[0]))
+            self._icon_cache[key] = ic
+        return ic
+
+    def _type_for(self, e):
+        key = "<dir>" if e.is_dir else (e.ext or "<file>")
+        t = self._type_cache.get(key)
+        if t is None:
+            t = self._icon_provider.type(QFileInfo(e.paths[0])) or ""
+            self._type_cache[key] = t
+        return t
+
+    # ---- ヘルパ ----
+    def entry_at(self, index):
+        if not index.isValid():
+            return None
+        return self._entries[index.row()]
+
+    def path_at(self, index):
+        e = self.entry_at(index)
+        return e.paths[0] if e else ""
+
+    def paths_at(self, index):
+        e = self.entry_at(index)
+        return list(e.paths) if e else []
+
+
 class ExplorerPanel(QWidget):
-    """右側に埋め込むファイルブラウザ（名前/サイズ/種類/更新日時）"""
+    """右側に埋め込むファイルブラウザ（名前/サイズ/更新日時、連番まとめ対応）"""
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
@@ -1498,37 +1761,39 @@ class ExplorerPanel(QWidget):
         self.close_button.setText("✕")
         self.close_button.setToolTip("パネルを閉じる")
         self.close_button.setFixedSize(26, 24)
+        self.seq_check = QCheckBox("seq")
+        self.seq_check.setChecked(True)
+        self.seq_check.setToolTip("連番ファイルを 名前.####.ext のように1行にまとめて表示")
         bar.addWidget(self.up_button)
         bar.addWidget(self.path_edit)
+        bar.addWidget(self.seq_check)
         bar.addWidget(self.open_os_button)
         bar.addWidget(self.close_button)
         layout.addLayout(bar)
 
-        # ファイルツリー
-        self.model = QFileSystemModel()
-        self.model.setRootPath("")
+        # ファイルリスト（連番まとめ対応モデル）
+        self.model = SeqFileModel(self)
         self.tree = _FileTreeView(self)
         self.tree.setModel(self.model)
         self.tree.setSortingEnabled(True)
-        self.tree.setRootIsDecorated(True)
+        self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         # 外部からのドロップを受け付け、かつ自身もドラッグ元にする
-        # （ブックマーク表へドラッグして登録できるように）
         self.tree.setAcceptDrops(True)
         self.tree.setDragEnabled(True)
         self.tree.setDropIndicatorShown(True)
         self.tree.setDragDropMode(QAbstractItemView.DragDrop)
         self.tree.setDefaultDropAction(Qt.CopyAction)
         header = self.tree.header()
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, self.model.columnCount()):
-            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        # 列順を Windows エクスプローラ風に: 名前 / 更新日時 / 種類 / サイズ
-        header.moveSection(3, 1)  # 更新日時(logical 3) を名前の右へ
-        header.moveSection(3, 2)  # 種類(logical 2) をその右へ
+        header.setSectionResizeMode(QHeaderView.Interactive)  # 列を手動リサイズ可能に
+        header.setStretchLastSection(False)
+        self.tree.setColumnWidth(0, 240)  # 名前
+        self.tree.setColumnWidth(1, 80)   # サイズ
+        self.tree.setColumnWidth(2, 110)  # 種類
+        self.tree.setColumnWidth(3, 130)  # 更新日時
         self.tree.doubleClicked.connect(self._on_double_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.open_context_menu)
@@ -1536,16 +1801,23 @@ class ExplorerPanel(QWidget):
 
         self.current_root = ""
         self.add_bookmark_callback = None  # ProjectManager 側で設定
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.directoryChanged.connect(lambda _p: self.model.reload())
         self.up_button.clicked.connect(self.go_up)
         self.open_os_button.clicked.connect(self.open_in_os)
+        self.seq_check.toggled.connect(self.model.set_seq_enabled)
         # close_button は ProjectManager 側で接続
 
     def set_root(self, path):
         self.current_root = path
-        idx = self.model.setRootPath(path)
-        self.tree.setRootIndex(idx)
+        self.model.set_directory(path)
         self.path_edit.setText(os.path.normpath(path))
         self.tree.scrollToTop()
+        old = self.watcher.directories()
+        if old:
+            self.watcher.removePaths(old)
+        if os.path.isdir(path):
+            self.watcher.addPath(path)
 
     def go_up(self):
         if not self.current_root:
@@ -1559,24 +1831,26 @@ class ExplorerPanel(QWidget):
             os.startfile(self.current_root)
 
     def _on_double_clicked(self, index):
-        path = self.model.filePath(index)
-        if os.path.isdir(path):
-            self.set_root(path)          # フォルダは中へ潜る
-        elif os.path.exists(path):
+        e = self.model.entry_at(index)
+        if not e:
+            return
+        if e.is_dir:
+            self.set_root(e.paths[0])     # フォルダは中へ潜る
+        else:
             try:
-                os.startfile(path)        # ファイルは起動
-            except Exception as e:
-                QMessageBox.warning(self, "エラー", f"開けませんでした: {e}")
+                os.startfile(e.paths[0])  # ファイル/連番は先頭フレームを起動
+            except Exception as ex:
+                QMessageBox.warning(self, "エラー", f"開けませんでした: {ex}")
 
     def selected_paths(self):
         seen, out = set(), []
         for idx in self.tree.selectedIndexes():
             if idx.column() != 0:
                 continue
-            p = self.model.filePath(idx)
-            if p and p not in seen:
-                seen.add(p)
-                out.append(p)
+            for p in self.model.paths_at(idx):  # 連番は全フレームに展開
+                if p and p not in seen:
+                    seen.add(p)
+                    out.append(p)
         return out
 
     def delete_selected(self):
@@ -1597,6 +1871,7 @@ class ExplorerPanel(QWidget):
                 QMessageBox.warning(self, "エラー", "削除に失敗しました。")
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"削除に失敗しました: {e}")
+        self.model.reload()
 
     def handle_external_drop(self, sources, dest_dir):
         """エクスプローラからのドロップ時に コピー/移動 を選ばせる"""
@@ -1613,6 +1888,7 @@ class ExplorerPanel(QWidget):
                 shell_copy_move(sources, dest_dir, move=True)
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
+        self.model.reload()
 
     # ---------- 右クリックメニュー ----------
     def open_context_menu(self, pos):
@@ -1620,9 +1896,11 @@ class ExplorerPanel(QWidget):
         # 未選択の項目を右クリックしたらその項目を選択（複数選択中はそのまま）
         if index.isValid() and not self.tree.selectionModel().isSelected(index):
             self.tree.setCurrentIndex(index)
-        item_path = self.model.filePath(index) if index.isValid() else ""
-        is_item = bool(item_path)
-        is_dir = os.path.isdir(item_path) if is_item else True
+        entry = self.model.entry_at(index) if index.isValid() else None
+        is_item = entry is not None
+        is_dir = bool(entry and entry.is_dir)
+        is_seq = bool(entry and entry.is_seq)
+        item_path = entry.paths[0] if entry else ""
         target = item_path if is_item else self.current_root
         if not target:
             return
@@ -1632,7 +1910,8 @@ class ExplorerPanel(QWidget):
         sendto_actions = {}
 
         if is_item:
-            act_rename = menu.addAction("名前を変更")
+            if not is_seq:  # 連番のまとめ行はリネーム対象外
+                act_rename = menu.addAction("名前を変更")
             if not is_dir:
                 act_openwith = menu.addAction("プログラムから開く")
             if is_archive(item_path):
@@ -1682,6 +1961,7 @@ class ExplorerPanel(QWidget):
                 open_with_dialog(item_path)
             elif act_extract is not None and action == act_extract:
                 extract_archive_here(item_path)
+                self.model.reload()
             elif action in sendto_actions:
                 run_sendto(sendto_actions[action], item_path)
             elif action == act_bookmark:
@@ -1712,6 +1992,7 @@ class ExplorerPanel(QWidget):
         new, ok = QInputDialog.getText(self, "名前を変更", "新しい名前:", text=old)
         if ok and new and new != old:
             os.rename(path, os.path.join(os.path.dirname(path), new))
+            self.model.reload()
 
     def _create_new(self, kind):
         base_dir = self.current_root
@@ -1722,6 +2003,7 @@ class ExplorerPanel(QWidget):
             new, ok = QInputDialog.getText(self, "フォルダを作成", "フォルダ名:", text=default)
             if ok and new:
                 os.makedirs(unique_path(base_dir, new), exist_ok=False)
+                self.model.reload()
         else:
             default = "新しいテキスト.txt"
             new, ok = QInputDialog.getText(self, "テキストを作成", "ファイル名:", text=default)
@@ -1729,6 +2011,7 @@ class ExplorerPanel(QWidget):
                 if not os.path.splitext(new)[1]:
                     new += ".txt"
                 open(unique_path(base_dir, new), "w", encoding="utf-8").close()
+                self.model.reload()
 
 
 class ProjectManager(QWidget):
