@@ -629,6 +629,8 @@ class ConfigurableButton(QPushButton):
         set_path_action = menu.addAction("パスを指定")
         edit_path_action = menu.addAction("パスを編集")
         set_label_action = menu.addAction("ボタンラベルを設定")
+        menu.addSeparator()
+        clear_action = menu.addAction("ボタンをクリア")
 
         action = menu.exec_(self.mapToGlobal(pos))
 
@@ -660,6 +662,17 @@ class ConfigurableButton(QPushButton):
                 if self.update_callback:
                     self.update_callback("label", label)
                     self.update_callback("icon", icon_path)
+
+        elif action == clear_action:
+            # 初期化: パス・アイコンを消して既定ラベルに戻す
+            default_label = f"ボタン{self.button_index + 1}"
+            self.program_path = ""
+            self.icon_path = ""
+            self.set_button_label(default_label)
+            if self.update_callback:
+                self.update_callback("program", "")
+                self.update_callback("icon", "")
+                self.update_callback("label", default_label)
 
 
 # ============================================================
@@ -1262,10 +1275,14 @@ def get_sendto_dir():
     return os.path.join(appdata, "Microsoft", "Windows", "SendTo") if appdata else ""
 
 
-def run_sendto(link_path, target_path):
-    """SendTo のショートカット等に対象ファイルを渡して実行"""
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "open", link_path, f'"{os.path.normpath(target_path)}"', None, 1)
+def run_sendto(link_path, target_paths):
+    """SendTo のショートカット等に対象ファイルを渡して実行。
+    連番など複数ファイルの場合は全パスを引数として渡す。"""
+    if isinstance(target_paths, str):
+        target_paths = [target_paths]
+    params = " ".join(
+        f'"{os.path.normpath(p).replace(os.sep, "/")}"' for p in target_paths)
+    ctypes.windll.shell32.ShellExecuteW(None, "open", link_path, params, None, 1)
 
 
 def _sendkeys_escape(text):
@@ -1508,6 +1525,18 @@ def format_mtime(mtime):
     return time.strftime("%Y/%m/%d %H:%M", time.localtime(mtime))
 
 
+_FILE_ATTRIBUTE_HIDDEN = 0x2
+_FILE_ATTRIBUTE_SYSTEM = 0x4
+
+
+def _is_hidden(name, st):
+    """Windowsの隠し/システム属性、または .始まりの名前を隠しとみなす"""
+    attr = getattr(st, "st_file_attributes", 0)
+    if attr & (_FILE_ATTRIBUTE_HIDDEN | _FILE_ATTRIBUTE_SYSTEM):
+        return True
+    return name.startswith(".")
+
+
 class _Entry:
     __slots__ = ("display", "paths", "is_dir", "is_seq", "size", "mtime",
                  "sort_name", "ext")
@@ -1533,6 +1562,7 @@ class SeqFileModel(QAbstractTableModel):
         self._dir = ""
         self._entries = []
         self._seq_enabled = True
+        self._show_hidden = False
         self._icon_provider = QFileIconProvider()
         self._icon_cache = {}
         self._type_cache = {}
@@ -1543,6 +1573,11 @@ class SeqFileModel(QAbstractTableModel):
     def set_seq_enabled(self, on):
         if self._seq_enabled != bool(on):
             self._seq_enabled = bool(on)
+            self.reload()
+
+    def set_show_hidden(self, on):
+        if self._show_hidden != bool(on):
+            self._show_hidden = bool(on)
             self.reload()
 
     def set_directory(self, path):
@@ -1569,6 +1604,8 @@ class SeqFileModel(QAbstractTableModel):
                 st = os.stat(full)
             except OSError:
                 continue
+            if not self._show_hidden and _is_hidden(n, st):
+                continue
             if os.path.isdir(full):
                 dirs.append(_Entry(n, [full], True, False, 0, st.st_mtime, n.lower(), ""))
             else:
@@ -1576,20 +1613,26 @@ class SeqFileModel(QAbstractTableModel):
 
         file_entries = []
         if self._seq_enabled:
+            # 桁数はキーに含めない。ゼロ埋めの有無で padding を後から決めるので、
+            # 0-9 と 10-52 のような非ゼロ埋め連番も1つにまとまる。
             groups, singles = {}, []
             for n, full, st in files:
                 m = SEQ_RE.match(n)
                 if m:
                     prefix, sep, frame, ext = m.groups()
-                    groups.setdefault((prefix, sep, ext, len(frame)), []).append(
-                        (int(frame), full, st))
+                    groups.setdefault((prefix, sep, ext), []).append(
+                        (int(frame), full, st, frame))
                 else:
                     singles.append((n, full, st))
-            for (prefix, sep, ext, pad), members in groups.items():
+            for (prefix, sep, ext), members in groups.items():
                 if len(members) >= 2:
                     members.sort(key=lambda x: x[0])
                     frames = [mm[0] for mm in members]
                     paths = [mm[1] for mm in members]
+                    frame_strs = [mm[3] for mm in members]
+                    # 先頭ゼロがあればゼロ埋め連番 → その桁数、無ければ非ゼロ埋め(#1個)
+                    padded = any(len(fr) > 1 and fr[0] == "0" for fr in frame_strs)
+                    pad = max(len(fr) for fr in frame_strs) if padded else 1
                     total = sum(mm[2].st_size for mm in members)
                     mtime = max(mm[2].st_mtime for mm in members)
                     disp = f"{prefix}{sep}{'#' * pad}{ext} {frames[0]}-{frames[-1]}"
@@ -1597,7 +1640,7 @@ class SeqFileModel(QAbstractTableModel):
                         disp, paths, False, True, total, mtime,
                         (prefix + sep + ext).lower(), ext.lower()))
                 else:
-                    _, full, st = members[0]
+                    _, full, st, _fr = members[0]
                     n = os.path.basename(full)
                     file_entries.append(_Entry(
                         n, [full], False, False, st.st_size, st.st_mtime,
@@ -1752,7 +1795,7 @@ class ExplorerPanel(QWidget):
         self.up_button.setToolTip("上のフォルダへ")
         self.up_button.setFixedSize(26, 24)
         self.path_edit = QLineEdit()
-        self.path_edit.setReadOnly(True)
+        self.path_edit.setToolTip("パスを入力して Enter で移動")
         self.open_os_button = QToolButton()
         self.open_os_button.setText("⧉")
         self.open_os_button.setToolTip("エクスプローラで開く")
@@ -1761,11 +1804,14 @@ class ExplorerPanel(QWidget):
         self.close_button.setText("✕")
         self.close_button.setToolTip("パネルを閉じる")
         self.close_button.setFixedSize(26, 24)
+        self.hidden_check = QCheckBox("show hidden")
+        self.hidden_check.setToolTip("隠しファイルを表示")
         self.seq_check = QCheckBox("seq")
         self.seq_check.setChecked(True)
         self.seq_check.setToolTip("連番ファイルを 名前.####.ext のように1行にまとめて表示")
         bar.addWidget(self.up_button)
         bar.addWidget(self.path_edit)
+        bar.addWidget(self.hidden_check)
         bar.addWidget(self.seq_check)
         bar.addWidget(self.open_os_button)
         bar.addWidget(self.close_button)
@@ -1806,18 +1852,37 @@ class ExplorerPanel(QWidget):
         self.up_button.clicked.connect(self.go_up)
         self.open_os_button.clicked.connect(self.open_in_os)
         self.seq_check.toggled.connect(self.model.set_seq_enabled)
+        self.hidden_check.toggled.connect(self.model.set_show_hidden)
+        self.path_edit.returnPressed.connect(self._on_path_entered)
         # close_button は ProjectManager 側で接続
 
     def set_root(self, path):
         self.current_root = path
         self.model.set_directory(path)
-        self.path_edit.setText(os.path.normpath(path))
+        # パス表示は常に / 区切り
+        self.path_edit.setText(os.path.normpath(path).replace("\\", "/"))
         self.tree.scrollToTop()
         old = self.watcher.directories()
         if old:
             self.watcher.removePaths(old)
         if os.path.isdir(path):
             self.watcher.addPath(path)
+
+    def _on_path_entered(self):
+        text = self.path_edit.text().strip().strip('"')
+        if not text:
+            return
+        p = os.path.normpath(text)  # \ でも / でも受け付ける
+        if os.path.isdir(p):
+            self.set_root(p)
+        elif os.path.isfile(p):
+            self.set_root(os.path.dirname(p))  # ファイル指定ならその親へ
+        else:
+            QMessageBox.warning(self, "エラー", "パスが見つかりません:\n" + text)
+            # 表示を現在地へ戻す（/ 区切り）
+            if self.current_root:
+                self.path_edit.setText(
+                    os.path.normpath(self.current_root).replace("\\", "/"))
 
     def go_up(self):
         if not self.current_root:
@@ -1963,7 +2028,9 @@ class ExplorerPanel(QWidget):
                 extract_archive_here(item_path)
                 self.model.reload()
             elif action in sendto_actions:
-                run_sendto(sendto_actions[action], item_path)
+                # 連番は全フレームを引数として渡す
+                run_sendto(sendto_actions[action],
+                           self.selected_paths() or [item_path])
             elif action == act_bookmark:
                 if self.add_bookmark_callback:
                     self.add_bookmark_callback(target)
