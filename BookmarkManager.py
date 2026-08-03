@@ -27,7 +27,8 @@ if maya_version >= 2025:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
+        QListWidget, QListWidgetItem
     )
     from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
     from PySide6.QtCore import (
@@ -41,7 +42,8 @@ else:
         QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
-        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox
+        QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
+        QListWidget, QListWidgetItem
     )
     from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
     from PySide2.QtCore import (
@@ -930,6 +932,12 @@ class ProjectTab(QWidget):
         self.epSqShot_layout.addWidget(self.episode_combo)
         self.epSqShot_layout.addWidget(self.sequence_combo)
         self.epSqShot_layout.addWidget(self.shot_combo)
+        self.epsqshot_edit_button = QToolButton()
+        self.epsqshot_edit_button.setText("✎")
+        self.epsqshot_edit_button.setToolTip("ep / sq / shot を編集")
+        self.epsqshot_edit_button.setFixedSize(26, 24)
+        self.epsqshot_edit_button.clicked.connect(self.open_epsqshot_editor)
+        self.epSqShot_layout.addWidget(self.epsqshot_edit_button)
         self.layout.addLayout(self.epSqShot_layout)
 
         # --- プログラム起動ミニボタン ---
@@ -1068,6 +1076,18 @@ class ProjectTab(QWidget):
         if getattr(self, "initializing", False):
             return
         self.save_config()
+
+    def open_epsqshot_editor(self):
+        dlg = EpSqShotDialog(self, self.project_data.get("epSqShot", {}))
+        if dlg.exec_():
+            self.project_data["epSqShot"] = dlg.result_data()
+            # コンボを作り直す（信号は抑止して余計な保存/連鎖を防ぐ）
+            for c in (self.episode_combo, self.sequence_combo, self.shot_combo):
+                c.blockSignals(True)
+            self.load_ep_sq_shot()
+            for c in (self.episode_combo, self.sequence_combo, self.shot_combo):
+                c.blockSignals(False)
+            self.save_config()
 
     # ---------- ブックマーク ----------
     def load_bookmarks(self):
@@ -2092,6 +2112,260 @@ class ExplorerPanel(QWidget):
                     new += ".txt"
                 open(unique_path(base_dir, new), "w", encoding="utf-8").close()
                 self.model.reload()
+
+
+def _reorder_dict(d, key, delta):
+    keys = list(d.keys())
+    if key not in keys:
+        return d
+    i = keys.index(key)
+    j = i + delta
+    if 0 <= j < len(keys):
+        keys[i], keys[j] = keys[j], keys[i]
+        return {k: d[k] for k in keys}
+    return d
+
+
+def _rename_dict_key(d, old, new):
+    return {(new if k == old else k): v for k, v in d.items()}
+
+
+def _reorder_list(lst, i, delta):
+    j = i + delta
+    if 0 <= i < len(lst) and 0 <= j < len(lst):
+        lst[i], lst[j] = lst[j], lst[i]
+        return j
+    return i
+
+
+class EpSqShotDialog(QDialog):
+    """ep / sq / shot を3カラムで 追加・削除・並べ替え・改名 する"""
+    def __init__(self, parent, epsqshot):
+        super().__init__(parent)
+        self.setWindowTitle("ep / sq / shot の編集")
+        self.setMinimumSize(560, 420)
+        self.data = json.loads(json.dumps(epsqshot or {}))  # 編集用ディープコピー
+        self._loading = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+        hint = QLabel("列の項目はダブルクリックで名前変更。ボタンで 追加/削除/並べ替え。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        cols = QHBoxLayout()
+        cols.setSpacing(8)
+        root.addLayout(cols)
+        self.ep_list, ep_box = self._make_column(
+            "ep", self.add_ep, self.del_ep,
+            lambda: self.move_ep(-1), lambda: self.move_ep(1), self.rename_ep)
+        self.sq_list, sq_box = self._make_column(
+            "sq", self.add_sq, self.del_sq,
+            lambda: self.move_sq(-1), lambda: self.move_sq(1), self.rename_sq)
+        self.shot_list, shot_box = self._make_column(
+            "shot", self.add_shot, self.del_shot,
+            lambda: self.move_shot(-1), lambda: self.move_shot(1), self.rename_shot)
+        cols.addLayout(ep_box)
+        cols.addLayout(sq_box)
+        cols.addLayout(shot_box)
+
+        self.ep_list.currentRowChanged.connect(lambda _r: self._on_ep_changed())
+        self.sq_list.currentRowChanged.connect(lambda _r: self._on_sq_changed())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.refresh_ep()
+
+    def _make_column(self, title, on_add, on_del, on_up, on_down, on_rename):
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        box.addWidget(QLabel(title))
+        lst = QListWidget()
+        lst.setSelectionMode(QListWidget.SingleSelection)
+        lst.itemDoubleClicked.connect(lambda _it: on_rename())
+        box.addWidget(lst)
+        row = QHBoxLayout()
+        row.setSpacing(2)
+        for text, tip, fn in (("＋", "追加", on_add), ("－", "削除", on_del),
+                              ("↑", "上へ", on_up), ("↓", "下へ", on_down),
+                              ("✎", "名前変更", on_rename)):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFixedSize(26, 24)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch()
+        box.addLayout(row)
+        return lst, box
+
+    # ---- 選択の取得 ----
+    def current_ep(self):
+        it = self.ep_list.currentItem()
+        return it.text() if it else None
+
+    def current_sq(self):
+        it = self.sq_list.currentItem()
+        return it.text() if it else None
+
+    def _shots(self):
+        ep, sq = self.current_ep(), self.current_sq()
+        if ep and sq:
+            return self.data.get(ep, {}).get(sq)
+        return None
+
+    # ---- 再描画（ep→sq→shot 連鎖）----
+    def _on_ep_changed(self):
+        if not self._loading:
+            self.refresh_sq()
+
+    def _on_sq_changed(self):
+        if not self._loading:
+            self.refresh_shot()
+
+    def _select_name(self, lst, name):
+        if name is not None:
+            items = lst.findItems(name, Qt.MatchExactly)
+            if items:
+                lst.setCurrentItem(items[0])
+                return
+        if lst.count() > 0:
+            lst.setCurrentRow(0)
+
+    def refresh_ep(self, select=None):
+        self._loading = True
+        self.ep_list.clear()
+        for k in self.data:
+            self.ep_list.addItem(k)
+        self._select_name(self.ep_list, select)
+        self._loading = False
+        self.refresh_sq()
+
+    def refresh_sq(self, select=None):
+        self._loading = True
+        self.sq_list.clear()
+        ep = self.current_ep()
+        if ep and isinstance(self.data.get(ep), dict):
+            for k in self.data[ep]:
+                self.sq_list.addItem(k)
+        self._select_name(self.sq_list, select)
+        self._loading = False
+        self.refresh_shot()
+
+    def refresh_shot(self, select_row=None):
+        self._loading = True
+        self.shot_list.clear()
+        shots = self._shots()
+        if shots:
+            for s in shots:
+                self.shot_list.addItem(s)
+        if select_row is not None and 0 <= select_row < self.shot_list.count():
+            self.shot_list.setCurrentRow(select_row)
+        elif self.shot_list.count() > 0:
+            self.shot_list.setCurrentRow(0)
+        self._loading = False
+
+    # ---- ep 操作 ----
+    def add_ep(self):
+        name, ok = QInputDialog.getText(self, "ep 追加", "ep 名:")
+        if ok and name and name not in self.data:
+            self.data[name] = {}
+            self.refresh_ep(select=name)
+
+    def del_ep(self):
+        ep = self.current_ep()
+        if ep and ep in self.data:
+            del self.data[ep]
+            self.refresh_ep()
+
+    def move_ep(self, delta):
+        ep = self.current_ep()
+        if ep:
+            self.data = _reorder_dict(self.data, ep, delta)
+            self.refresh_ep(select=ep)
+
+    def rename_ep(self):
+        ep = self.current_ep()
+        if not ep:
+            return
+        new, ok = QInputDialog.getText(self, "ep 名の変更", "新しい名前:", text=ep)
+        if ok and new and new != ep and new not in self.data:
+            self.data = _rename_dict_key(self.data, ep, new)
+            self.refresh_ep(select=new)
+
+    # ---- sq 操作 ----
+    def add_sq(self):
+        ep = self.current_ep()
+        if not ep:
+            QMessageBox.information(self, "確認", "先に ep を選択/追加してください。")
+            return
+        name, ok = QInputDialog.getText(self, "sq 追加", "sq 名:")
+        if ok and name and name not in self.data[ep]:
+            self.data[ep][name] = []
+            self.refresh_sq(select=name)
+
+    def del_sq(self):
+        ep, sq = self.current_ep(), self.current_sq()
+        if ep and sq and sq in self.data[ep]:
+            del self.data[ep][sq]
+            self.refresh_sq()
+
+    def move_sq(self, delta):
+        ep, sq = self.current_ep(), self.current_sq()
+        if ep and sq:
+            self.data[ep] = _reorder_dict(self.data[ep], sq, delta)
+            self.refresh_sq(select=sq)
+
+    def rename_sq(self):
+        ep, sq = self.current_ep(), self.current_sq()
+        if not (ep and sq):
+            return
+        new, ok = QInputDialog.getText(self, "sq 名の変更", "新しい名前:", text=sq)
+        if ok and new and new != sq and new not in self.data[ep]:
+            self.data[ep] = _rename_dict_key(self.data[ep], sq, new)
+            self.refresh_sq(select=new)
+
+    # ---- shot 操作 ----
+    def add_shot(self):
+        shots = self._shots()
+        if shots is None:
+            QMessageBox.information(self, "確認", "先に ep と sq を選択/追加してください。")
+            return
+        name, ok = QInputDialog.getText(self, "shot 追加", "shot 名:")
+        if ok and name:
+            shots.append(name)
+            self.refresh_shot(select_row=len(shots) - 1)
+
+    def del_shot(self):
+        shots = self._shots()
+        i = self.shot_list.currentRow()
+        if shots is not None and 0 <= i < len(shots):
+            del shots[i]
+            self.refresh_shot(select_row=min(i, len(shots) - 1))
+
+    def move_shot(self, delta):
+        shots = self._shots()
+        i = self.shot_list.currentRow()
+        if shots is not None and 0 <= i < len(shots):
+            j = _reorder_list(shots, i, delta)
+            self.refresh_shot(select_row=j)
+
+    def rename_shot(self):
+        shots = self._shots()
+        i = self.shot_list.currentRow()
+        if shots is not None and 0 <= i < len(shots):
+            new, ok = QInputDialog.getText(
+                self, "shot 名の変更", "新しい名前:", text=shots[i])
+            if ok and new:
+                shots[i] = new
+                self.refresh_shot(select_row=i)
+
+    def result_data(self):
+        return self.data
 
 
 class ProjectManager(QWidget):
