@@ -1233,6 +1233,19 @@ def load_json_files():
     return results
 
 
+def default_project_data(name):
+    """新規/初期プロジェクトの既定値"""
+    return {
+        "name": name,
+        "bookmarks": [],
+        "buttons": [{"program": "", "label": f"ボタン{i + 1}"} for i in range(6)],
+        "epSqShot": {"ep1": {"s001": ["c001"]}},
+        "project_shot_structure": "N:/{proj}/shots/{ep}/{shot}",
+        "project_comp_structure": "N:/{proj}/comp/{ep}/{shot}",
+        "variables": {},
+    }
+
+
 def load_workspace():
     if os.path.exists(WORKSPACE_PATH):
         try:
@@ -2127,6 +2140,18 @@ class ProjectManager(QWidget):
         for data, source in entries:
             self._add_tab(data, source)
 
+        # まっさらな環境（プロジェクトjsonが1つも無い）なら初期プロジェクトを作る
+        if not self.project_tabs:
+            data = default_project_data("MyProject")
+            home = os.path.expanduser("~").replace("\\", "/")
+            data["bookmarks"] = [
+                f"Home | {home}",
+                f"Desktop | {home}/Desktop",
+                f"Downloads | {home}/Downloads",
+            ]
+            tab = self._add_tab(data, None)
+            tab.save_config()  # ~/.BookmarkManager/MyProject.json を作成
+
         current = ws.get("current")
         if current in self.project_tabs:
             self.tab_widget.setCurrentWidget(self.project_tabs[current])
@@ -2318,16 +2343,7 @@ class ProjectManager(QWidget):
         name, ok = QInputDialog.getText(self, "プロジェクト名", "プロジェクト名を入力:")
         if not ok or not name:
             return
-        project_data = {
-            "name": name,
-            "bookmarks": [],
-            "buttons": [{"program": "", "label": f"ボタン{i+1}"} for i in range(6)],
-            "epSqShot": {"ep1": {"s001": ["c001"]}},
-            "project_shot_structure": "N:/{proj}/shots/{ep}/{shot}",
-            "project_comp_structure": "N:/{proj}/comp/{ep}/{shot}",
-            "variables": {},
-        }
-        tab = self._add_tab(project_data, None)
+        tab = self._add_tab(default_project_data(name), None)
         tab.save_config()
         self.tab_widget.setCurrentWidget(tab)
         self.save_workspace()
