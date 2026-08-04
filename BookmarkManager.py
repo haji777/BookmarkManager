@@ -902,7 +902,8 @@ class BookmarkTableWidget(QTableWidget):
 # ============================================================
 class ProjectTab(QWidget):
     def __init__(self, project_data, add_project_callback, open_settings_callback,
-                 source_path=None, show_in_explorer_callback=None):
+                 source_path=None, show_in_explorer_callback=None,
+                 context_changed_callback=None):
         super().__init__()
         self.initializing = True
         self.sort_ascending = True
@@ -910,6 +911,7 @@ class ProjectTab(QWidget):
         self.add_project_callback = add_project_callback
         self.open_settings_callback = open_settings_callback
         self.show_in_explorer_callback = show_in_explorer_callback
+        self.context_changed_callback = context_changed_callback
         self.source_path = source_path  # 読み込み元（共有プロジェクト用）
 
         self.proj = project_data.get("name", "blank_project")
@@ -1076,6 +1078,9 @@ class ProjectTab(QWidget):
         if getattr(self, "initializing", False):
             return
         self.save_config()
+        # ep/sq/shot が変わったらファイルブラウザを追従させる
+        if self.context_changed_callback:
+            self.context_changed_callback(self)
 
     def open_epsqshot_editor(self):
         dlg = EpSqShotDialog(self, self.project_data.get("epSqShot", {}))
@@ -1164,7 +1169,8 @@ class ProjectTab(QWidget):
             resolved = resolve_path(path, self)
             if os.path.exists(resolved):
                 if self.show_in_explorer_callback:
-                    self.show_in_explorer_callback(resolved)
+                    # テンプレート(path)と所有タブも渡し、ep/sq/shot変更で追従できるように
+                    self.show_in_explorer_callback(resolved, path, self)
                 else:
                     os.startfile(resolved)
             else:
@@ -2439,15 +2445,19 @@ class ProjectManager(QWidget):
     def _add_tab(self, data, source_path):
         tab = ProjectTab(data, self.add_new_project, self.open_settings,
                          source_path=source_path,
-                         show_in_explorer_callback=self.show_in_explorer)
+                         show_in_explorer_callback=self.show_in_explorer,
+                         context_changed_callback=self.refresh_explorer_for)
         name = data.get("name", "Unnamed")
         self.tab_widget.addTab(tab, name)
         self.project_tabs[name] = tab
         return tab
 
-    def show_in_explorer(self, resolved_path):
+    def show_in_explorer(self, resolved_path, template=None, owner_tab=None):
         """ブックマークのダブルクリックで右側パネルにフォルダを表示"""
         if os.path.isdir(resolved_path):
+            # ep/sq/shot 変更で追従できるようテンプレートと所有タブを記憶
+            self._explorer_template = template
+            self._explorer_owner = owner_tab
             was_hidden = self.explorer.isHidden()
             self.explorer.setVisible(True)
             self.explorer.set_root(resolved_path)
@@ -2463,6 +2473,24 @@ class ProjectManager(QWidget):
                 os.startfile(resolved_path)
             except Exception as e:
                 QMessageBox.warning(self, "エラー", f"開けませんでした: {e}")
+
+    def refresh_explorer_for(self, tab):
+        """ep/sq/shot が変わったら、そのタブで開いたテンプレートを再解決して追従"""
+        if self.explorer.isHidden():
+            return
+        if getattr(self, "_explorer_owner", None) is not tab:
+            return
+        template = getattr(self, "_explorer_template", None)
+        if not template:
+            return
+        try:
+            resolved = resolve_path(template, tab)
+        except Exception:
+            return
+        if (os.path.isdir(resolved)
+                and os.path.normpath(resolved)
+                != os.path.normpath(self.explorer.current_root or "")):
+            self.explorer.set_root(resolved)
 
     def hide_explorer(self):
         if not self.explorer.isHidden():
