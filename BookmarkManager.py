@@ -146,10 +146,23 @@ def resolve_path(text, project_tab):
     return text
 
 
+# ホスト(mayapy/hython)が自分用に設定する環境変数。これを外部アプリに引き継ぐと
+# 相手の内蔵Python/Qtが壊れる（例: Nukeが "No module named 'nuke'"）。起動時に除去する。
+_HOST_ENV_STRIP = (
+    "PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE",
+    "PYTHONEXECUTABLE", "PYTHONSTARTUP", "PYTHONNOASSERT",
+    "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_PLATFORM",
+    "QML_IMPORT_PATH", "QML2_IMPORT_PATH",
+)
+
+
 def build_env(project_tab):
     """サブプロセス起動用の環境変数を作る"""
     pdata = project_tab.project_data
     env = os.environ.copy()
+    # ホスト固有の Python/Qt 変数を除去（外部アプリを素の環境で起動する）
+    for key in _HOST_ENV_STRIP:
+        env.pop(key, None)
     env["PROJ"] = project_tab.proj or ""
     env["SHOW"] = (pdata.get("show") or project_tab.proj) or ""
     env["EP"] = project_tab.ep or ""
