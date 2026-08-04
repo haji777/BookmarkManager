@@ -11,16 +11,12 @@ import shutil
 import re
 import time
 
-# Check if a version argument is provided
-if len(sys.argv) > 1:
-    maya_version = int(sys.argv[1])  # Get the Maya version from the command-line argument
-else:
-    print("Error: No Maya version provided.")
-    sys.exit(1)
+# 起動元の識別用（Maya=年バージョン, Houdini=21 等）。省略可。
+host_version = sys.argv[1] if len(sys.argv) > 1 else ""
 
-# Try importing PySide2 (for Maya 2023) or PySide6 (for Maya 2025 and beyond)
-print(f"Using Maya {maya_version}")
-if maya_version >= 2025:
+# PySide は環境依存: Maya2025+ / Houdini21 は PySide6、Maya2024以前は PySide2。
+# バージョン番号ではなく実際に import できる方を使う（Maya/Houdini 両対応）。
+try:
     from PySide6.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView,
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
@@ -35,7 +31,8 @@ if maya_version >= 2025:
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
         QAbstractTableModel, QFileSystemWatcher
     )
-else:
+    PYSIDE = 6
+except ImportError:
     from PySide2.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView,
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
@@ -50,6 +47,9 @@ else:
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
         QAbstractTableModel, QFileSystemWatcher
     )
+    PYSIDE = 2
+
+print(f"BookmarkManager: PySide{PYSIDE} (host={host_version or 'n/a'})")
 
 
 # --- アプリ本体とユーザーデータを分離する ---
