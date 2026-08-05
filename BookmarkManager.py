@@ -1897,6 +1897,11 @@ class ExplorerPanel(QWidget):
         self.tree.customContextMenuRequested.connect(self.open_context_menu)
         layout.addWidget(self.tree)
 
+        # 下部ステータスバー: 「12個の項目 ｜ 1個の項目を選択 23.4 KB」
+        self.status_label = QLabel("")
+        self.status_label.setContentsMargins(2, 0, 2, 0)
+        layout.addWidget(self.status_label)
+
         self.current_root = ""
         self.add_bookmark_callback = None  # ProjectManager 側で設定
         self.watcher = QFileSystemWatcher(self)
@@ -1906,7 +1911,28 @@ class ExplorerPanel(QWidget):
         self.seq_check.toggled.connect(self.model.set_seq_enabled)
         self.hidden_check.toggled.connect(self.model.set_show_hidden)
         self.path_edit.returnPressed.connect(self._on_path_entered)
+        self.tree.selectionModel().selectionChanged.connect(
+            lambda *_: self._update_status())
+        self.model.modelReset.connect(self._update_status)
+        self._update_status()
         # close_button は ProjectManager 側で接続
+
+    def _selected_rows(self):
+        return sorted({idx.row() for idx in self.tree.selectedIndexes()})
+
+    def _update_status(self):
+        total = self.model.rowCount()
+        rows = self._selected_rows()
+        if rows:
+            size = 0
+            for r in rows:
+                e = self.model.entry_at(self.model.index(r, 0))
+                if e:
+                    size += e.size
+            self.status_label.setText(
+                f"{total}個の項目 ｜ {len(rows)}個の項目を選択 {human_size(size)}")
+        else:
+            self.status_label.setText(f"{total}個の項目")
 
     def set_root(self, path):
         self.current_root = path
@@ -2007,6 +2033,42 @@ class ExplorerPanel(QWidget):
             QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
         self.model.reload()
 
+    # ---------- 切り取り / コピー / 貼り付け ----------
+    def clipboard_set_files(self, paths, cut):
+        if not paths:
+            return
+        md = QMimeData()
+        md.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        # Windows の切り取り/コピー判別: DROPEFFECT_MOVE=2 / DROPEFFECT_COPY=1
+        effect = 2 if cut else 1
+        md.setData("Preferred DropEffect", effect.to_bytes(4, "little"))
+        QApplication.clipboard().setMimeData(md)
+
+    def clipboard_has_files(self):
+        md = QApplication.clipboard().mimeData()
+        return bool(md and md.hasUrls())
+
+    def paste_into(self, dest_dir):
+        md = QApplication.clipboard().mimeData()
+        if not (md and md.hasUrls() and os.path.isdir(dest_dir)):
+            return
+        sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        sources = [s for s in sources if s and os.path.exists(s)]
+        if not sources:
+            return
+        cut = False
+        if md.hasFormat("Preferred DropEffect"):
+            raw = bytes(md.data("Preferred DropEffect"))
+            if len(raw) >= 4 and int.from_bytes(raw[:4], "little") == 2:
+                cut = True
+        try:
+            shell_copy_move(sources, dest_dir, move=cut)
+            if cut:
+                QApplication.clipboard().clear()
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"貼り付けに失敗しました: {e}")
+        self.model.reload()
+
     # ---------- 右クリックメニュー ----------
     def open_context_menu(self, pos):
         index = self.tree.indexAt(pos)
@@ -2053,6 +2115,12 @@ class ExplorerPanel(QWidget):
                 send_menu.setEnabled(False)
             menu.addSeparator()
 
+        act_cut = menu.addAction("切り取り") if is_item else None
+        act_copyfile = menu.addAction("コピー") if is_item else None
+        act_paste = menu.addAction("貼り付け")
+        act_paste.setEnabled(self.clipboard_has_files())
+        menu.addSeparator()
+
         act_bookmark = menu.addAction("ブックマークに追加")
         menu.addSeparator()
         act_copy = menu.addAction("パスをコピー")
@@ -2083,6 +2151,13 @@ class ExplorerPanel(QWidget):
                 # 連番は全フレームを引数として渡す
                 run_sendto(sendto_actions[action],
                            self.selected_paths() or [item_path])
+            elif act_cut is not None and action == act_cut:
+                self.clipboard_set_files(self.selected_paths(), cut=True)
+            elif act_copyfile is not None and action == act_copyfile:
+                self.clipboard_set_files(self.selected_paths(), cut=False)
+            elif action == act_paste:
+                dest = item_path if (is_item and is_dir) else self.current_root
+                self.paste_into(dest)
             elif action == act_bookmark:
                 if self.add_bookmark_callback:
                     self.add_bookmark_callback(target)
