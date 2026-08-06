@@ -1743,9 +1743,9 @@ class SeqFileModel(QAbstractTableModel):
             return None
         e = self._entries[index.row()]
         col = index.column()
+        if role in (Qt.DisplayRole, Qt.EditRole) and col == self.COL_NAME:
+            return e.display
         if role == Qt.DisplayRole:
-            if col == self.COL_NAME:
-                return e.display
             if col == self.COL_SIZE:
                 return "" if e.is_dir else human_size(e.size)
             if col == self.COL_TYPE:
@@ -1762,7 +1762,40 @@ class SeqFileModel(QAbstractTableModel):
         base = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         if index.isValid():
             base |= Qt.ItemIsDragEnabled
+            e = self._entries[index.row()]
+            # 名前列は（連番まとめ行を除き）インライン改名を許可
+            if index.column() == self.COL_NAME and not e.is_seq:
+                base |= Qt.ItemIsEditable
         return base
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid() or index.column() != self.COL_NAME:
+            return False
+        e = self._entries[index.row()]
+        if e.is_seq:
+            return False
+        new = str(value).strip()
+        src = e.paths[0]
+        old = os.path.basename(os.path.normpath(src))
+        if not new or new == old:
+            return False
+        dst = os.path.join(os.path.dirname(src), new)
+        if os.path.exists(dst):
+            QMessageBox.warning(None, "エラー", f"既に存在します: {new}")
+            return False
+        try:
+            os.rename(src, dst)
+        except OSError as ex:
+            QMessageBox.warning(None, "エラー", f"名前を変更できません: {ex}")
+            return False
+        # モデルをその場で更新（リセットせず編集確定と干渉しないように）
+        e.paths[0] = dst
+        e.display = new
+        e.sort_name = new.lower()
+        if not e.is_dir:
+            e.ext = os.path.splitext(new)[1].lower()
+        self.dataChanged.emit(index, self.index(index.row(), self.columnCount() - 1))
+        return True
 
     def sort(self, column, order=Qt.AscendingOrder):
         self._sort_col = column
@@ -1876,7 +1909,9 @@ class ExplorerPanel(QWidget):
         self.tree.setSortingEnabled(True)
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # ゆっくり2度クリック(選択済みをクリック) / F2 でインライン改名
+        self.tree.setEditTriggers(
+            QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         # 外部からのドロップを受け付け、かつ自身もドラッグ元にする
