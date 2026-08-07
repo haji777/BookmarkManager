@@ -10,6 +10,11 @@ import ctypes
 import shutil
 import re
 import time
+import warnings
+
+# PySide6 では QWidget.exec_() が非推奨だが、PySide2(Maya2024以前)は exec_() のみ。
+# 両対応のため exec_() を使い続け、その DeprecationWarning だけ抑制する。
+warnings.filterwarnings("ignore", message=r".*exec_.*", category=DeprecationWarning)
 
 # 起動元の識別用（Maya=年バージョン, Houdini=21 等）。省略可。
 host_version = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -632,7 +637,7 @@ class ConfigurableButton(QPushButton):
                 drag.setMimeData(mime)
                 drag.setPixmap(self.grab())
                 if hasattr(drag, "exec"):
-                    drag.exec(Qt.MoveAction)
+                    drag.exec_(Qt.MoveAction)
                 else:
                     drag.exec_(Qt.MoveAction)
                 self.drag_start_pos = None
