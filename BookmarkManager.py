@@ -54,8 +54,6 @@ except ImportError:
     )
     PYSIDE = 2
 
-print(f"BookmarkManager: PySide{PYSIDE} (host={host_version or 'n/a'})")
-
 
 # --- アプリ本体とユーザーデータを分離する ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
