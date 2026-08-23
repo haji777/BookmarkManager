@@ -31,7 +31,9 @@ try:
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
         QListWidget, QListWidgetItem
     )
-    from PySide6.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
+    from PySide6.QtGui import (
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
+    )
     from PySide6.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
         QAbstractTableModel, QFileSystemWatcher
@@ -47,7 +49,9 @@ except ImportError:
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
         QListWidget, QListWidgetItem
     )
-    from PySide2.QtGui import QIcon, QColor, QFont, QPalette, QDrag, QCursor
+    from PySide2.QtGui import (
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
+    )
     from PySide2.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
         QAbstractTableModel, QFileSystemWatcher
@@ -816,13 +820,28 @@ class BookmarkTableWidget(QTableWidget):
                 self.selectRow(drop_row + i)
             self.parent_tab.commit_bookmarks()
             event.acceptProposedAction()
-        elif event.mimeData().hasFormat(SEQ_MIME):
-            # 連番のまとめ行はブックマーク登録禁止
-            event.ignore()
         elif event.mimeData().hasUrls():
-            # --- 外部/ファイルブラウザからのドロップでブックマーク追加 ---
+            md = event.mimeData()
+            row = self.rowAt(_event_pos(event).y())
+            # ブックマーク(フォルダ)の上にドロップ → その中へコピー/移動
+            if row >= 0:
+                _, path, _c = self.row_data(row)
+                dest = resolve_path(path, self.parent_tab) if path else ""
+                if dest and os.path.isdir(dest):
+                    sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+                    sources = [s for s in sources if s and os.path.exists(s)]
+                    if sources:
+                        self._copy_move_into(sources, dest)
+                        event.setDropAction(Qt.CopyAction)
+                        event.accept()
+                        return
+            # 空きスペースへのドロップ → ブックマーク登録
+            if md.hasFormat(SEQ_MIME):
+                # 連番のまとめ行は登録禁止
+                event.ignore()
+                return
             added = False
-            for url in event.mimeData().urls():
+            for url in md.urls():
                 path = url.toLocalFile()
                 if path and os.path.exists(path):
                     name = os.path.basename(os.path.normpath(path))
@@ -836,6 +855,22 @@ class BookmarkTableWidget(QTableWidget):
             event.accept()
         else:
             event.ignore()
+
+    def _copy_move_into(self, sources, dest_dir):
+        """ブックマーク(フォルダ)へドロップされたファイルをコピー/移動"""
+        menu = QMenu(self)
+        a_copy = menu.addAction("ここにコピー")
+        a_move = menu.addAction("ここに移動")
+        menu.addSeparator()
+        menu.addAction("キャンセル")
+        chosen = menu.exec_(QCursor.pos())
+        try:
+            if chosen == a_copy:
+                shell_copy_move(sources, dest_dir, move=False)
+            elif chosen == a_move:
+                shell_copy_move(sources, dest_dir, move=True)
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
 
     # ---------- キー操作 ----------
     def keyPressEvent(self, event):
@@ -1517,6 +1552,12 @@ class _FileTreeView(QTreeView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
             self.panel.delete_selected()
+        elif event.matches(QKeySequence.Copy):
+            self.panel.clipboard_set_files(self.panel.selected_paths(), cut=False)
+        elif event.matches(QKeySequence.Cut):
+            self.panel.clipboard_set_files(self.panel.selected_paths(), cut=True)
+        elif event.matches(QKeySequence.Paste):
+            self.panel.paste_into(self.panel.current_root)
         else:
             super().keyPressEvent(event)
 
