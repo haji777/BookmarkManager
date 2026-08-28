@@ -153,6 +153,22 @@ def resolve_path(text, project_tab):
     return text
 
 
+def nearest_existing_path(path, max_up=2):
+    """path が存在しなければ max_up 階層まで親を遡り、最初に存在する場所を返す。
+    どれも無ければ None。"""
+    if not path:
+        return None
+    candidate = os.path.normpath(path)
+    for _ in range(max_up + 1):  # 自身 + 親 max_up 回
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(candidate)
+        if not parent or parent == candidate:  # ドライブ直下などで止める
+            break
+        candidate = parent
+    return None
+
+
 # ホスト(mayapy/hython)が自分用に設定する環境変数。これを外部アプリに引き継ぐと
 # 相手の内蔵Python/Qtが壊れる（例: Nukeが "No module named 'nuke'"）。起動時に除去する。
 _HOST_ENV_STRIP = (
@@ -1218,14 +1234,18 @@ class ProjectTab(QWidget):
         try:
             self.update_label()
             resolved = resolve_path(path, self)
-            if os.path.exists(resolved):
+            # 見つからなければ 2階層まで上を試す
+            target = nearest_existing_path(resolved, max_up=2)
+            if target:
                 if self.show_in_explorer_callback:
-                    # テンプレート(path)と所有タブも渡し、ep/sq/shot変更で追従できるように
-                    self.show_in_explorer_callback(resolved, path, self)
+                    # テンプレート(path)を渡し、ep/sq/shot変更で追従できるように
+                    self.show_in_explorer_callback(target, path, self)
                 else:
-                    os.startfile(resolved)
+                    os.startfile(target)
             else:
-                QMessageBox.warning(self, "エラー", "フォルダが見つかりません: " + resolved)
+                QMessageBox.warning(
+                    self, "エラー",
+                    "フォルダが見つかりません（上位フォルダも確認しました）:\n" + resolved)
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"予期しないエラー: {e}")
 
