@@ -81,6 +81,7 @@ DEFAULT_SETTINGS = {
     "font_size": "9",
     "user_name": "",          # 空ならシステムのユーザー名を使う
     "shared_project_dir": "",  # ネットワーク上の共有プロジェクトjson置き場
+    "ffprobe_path": "",        # 動画メタデータ用。空なら自動検出
 }
 
 
@@ -370,10 +371,22 @@ class SettingsDialog(QDialog):
         shared_wrap = QWidget()
         shared_wrap.setLayout(shared_row)
 
+        self.ffprobe_edit = QLineEdit(GLOBAL_SETTINGS.get("ffprobe_path", "") or "")
+        self.ffprobe_edit.setPlaceholderText("空欄で自動検出（PATH / $HFS/bin）")
+        ff_row = QHBoxLayout()
+        ff_row.addWidget(self.ffprobe_edit)
+        ff_browse = QPushButton("参照...")
+        ff_browse.clicked.connect(self._browse_ffprobe)
+        ff_row.addWidget(ff_browse)
+        ff_wrap = QWidget()
+        ff_wrap.setLayout(ff_row)
+
         form.addRow("文字サイズ", self.font_spin)
         form.addRow("ユーザー名", self.user_edit)
         form.addRow("共有プロジェクト\nフォルダ", shared_wrap)
-        note = QLabel("※共有フォルダ内の *.json は起動時にタブとして読み込まれます")
+        form.addRow("ffprobe パス", ff_wrap)
+        note = QLabel("※共有フォルダ内の *.json は起動時にタブとして読み込まれます\n"
+                      "※ffprobe は動画メタデータ表示に使用（Houdiniの hffprobe.exe 等）")
         note.setWordWrap(True)
         form.addRow(note)
         return w
@@ -382,6 +395,12 @@ class SettingsDialog(QDialog):
         d = QFileDialog.getExistingDirectory(self, "共有プロジェクトフォルダを選択")
         if d:
             self.shared_edit.setText(d)
+
+    def _browse_ffprobe(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "ffprobe を選択", "", "実行ファイル (*.exe);;すべてのファイル (*)")
+        if p:
+            self.ffprobe_edit.setText(p)
 
     def accept(self):
         # --- プロジェクト設定を反映 ---
@@ -409,6 +428,7 @@ class SettingsDialog(QDialog):
         GLOBAL_SETTINGS["font_size"] = str(self.font_spin.value())
         GLOBAL_SETTINGS["user_name"] = self.user_edit.text().strip()
         GLOBAL_SETTINGS["shared_project_dir"] = self.shared_edit.text().strip()
+        GLOBAL_SETTINGS["ffprobe_path"] = self.ffprobe_edit.text().strip()
         save_global_settings(GLOBAL_SETTINGS)
         apply_font_size(self.font_spin.value())
 
@@ -2037,6 +2057,10 @@ def _decode_exr_attr(atype, value):
 
 
 def find_ffprobe():
+    # 設定で明示指定があれば最優先
+    configured = (GLOBAL_SETTINGS.get("ffprobe_path") or "").strip()
+    if configured and os.path.exists(configured):
+        return configured
     for name in ("ffprobe", "hffprobe"):
         cand = shutil.which(name)
         if cand:
@@ -2231,20 +2255,21 @@ class MetadataWindow(QWidget):
         self.v.setContentsMargins(8, 8, 8, 8)
         self.v.setSpacing(6)
 
-        self._tables = []
-        self._trees = []
+        self._sections = []  # (header_widget, content_widget, is_tree)
         ci = 0
         for name, rows in meta["sections"]:
-            self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
+            hd = self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)])
             t = self._kv_table(rows)
-            self._tables.append(t)
+            self.v.addWidget(hd)
             self.v.addWidget(t)
+            self._sections.append((hd, t, False))
             ci += 1
         for name, obj in meta["json_sections"]:
-            self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
+            hd = self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)])
             tree = self._json_tree(obj)
-            self._trees.append(tree)
+            self.v.addWidget(hd)
             self.v.addWidget(tree)
+            self._sections.append((hd, tree, True))
             ci += 1
         self.v.addStretch()
 
@@ -2270,15 +2295,25 @@ class MetadataWindow(QWidget):
 
     def _apply_filter(self, text):
         patterns = _filter_patterns(text)
-        for t in self._tables:
-            for r in range(t.rowCount()):
-                key_item = t.item(r, 0)
-                key = key_item.text() if key_item else ""
-                t.setRowHidden(r, not _key_matches(key, patterns))
-            self._resize_table(t)
-        for tree in self._trees:
-            for i in range(tree.topLevelItemCount()):
-                self._filter_tree_item(tree.topLevelItem(i), patterns)
+        for hd, w, is_tree in self._sections:
+            if is_tree:
+                visible = False
+                for i in range(w.topLevelItemCount()):
+                    if self._filter_tree_item(w.topLevelItem(i), patterns):
+                        visible = True
+            else:
+                visible = False
+                for r in range(w.rowCount()):
+                    key_item = w.item(r, 0)
+                    key = key_item.text() if key_item else ""
+                    show = _key_matches(key, patterns)
+                    w.setRowHidden(r, not show)
+                    if show:
+                        visible = True
+                self._resize_table(w)
+            # 見えるものが無いセクションは見出しごと隠す
+            w.setVisible(visible)
+            hd.setVisible(visible)
 
     def _filter_tree_item(self, item, patterns):
         if not patterns or _key_matches(item.text(0), patterns):
