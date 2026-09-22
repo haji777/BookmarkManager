@@ -11,6 +11,7 @@ import shutil
 import re
 import time
 import struct
+import fnmatch
 import warnings
 
 # PySide6 では QWidget.exec_() が非推奨だが、PySide2(Maya2024以前)は exec_() のみ。
@@ -2138,6 +2139,54 @@ def extract_metadata(path):
 
 _SECTION_COLORS = ["#4a90e2", "#50b060", "#c86fc9", "#e0913a", "#3aa8a8", "#b0554a"]
 _METADATA_WINDOWS = []  # 参照保持（GC/複数比較用）
+_FILTER_HISTORY_PATH = os.path.join(USER_DATA_DIR, "metadata_filters.json")
+_METADATA_FILTER_HISTORY = None
+
+
+def load_filter_history():
+    global _METADATA_FILTER_HISTORY
+    if _METADATA_FILTER_HISTORY is None:
+        try:
+            with open(_FILTER_HISTORY_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            _METADATA_FILTER_HISTORY = [str(x) for x in data] if isinstance(data, list) else []
+        except Exception:
+            _METADATA_FILTER_HISTORY = []
+    return _METADATA_FILTER_HISTORY
+
+
+def push_filter_history(text):
+    text = (text or "").strip()
+    if not text:
+        return
+    hist = load_filter_history()
+    if text in hist:
+        hist.remove(text)
+    hist.insert(0, text)
+    del hist[30:]
+    try:
+        with open(_FILTER_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(hist, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"フィルタ履歴の保存に失敗: {e}")
+
+
+def _filter_patterns(text):
+    """スペース区切りのグロブへ。ワイルドカード無しの語は部分一致(*x*)にする。"""
+    pats = []
+    for p in (text or "").split():
+        p = p.lower()
+        if not any(c in p for c in "*?[]"):
+            p = f"*{p}*"
+        pats.append(p)
+    return pats
+
+
+def _key_matches(key, patterns):
+    if not patterns:
+        return True
+    k = str(key).lower()
+    return any(fnmatch.fnmatch(k, p) for p in patterns)
 
 
 class MetadataWindow(QWidget):
@@ -2158,6 +2207,23 @@ class MetadataWindow(QWidget):
         title.setTextInteractionFlags(Qt.TextSelectableByMouse)
         outer.addWidget(title)
 
+        # フィルタ（編集可能コンボ＝履歴プルダウン）
+        fbar = QHBoxLayout()
+        fbar.setContentsMargins(8, 6, 8, 2)
+        fbar.setSpacing(4)
+        fbar.addWidget(QLabel("filter:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.setEditable(True)
+        self.filter_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.filter_combo.lineEdit().setPlaceholderText("例) Render* open*")
+        self.filter_combo.setToolTip(
+            "スペース区切りで複数指定（いずれか一致するキーを表示）。* ? が使えます。")
+        self._reload_filter_combo(current="")
+        self.filter_combo.lineEdit().returnPressed.connect(self._apply_from_combo)
+        self.filter_combo.activated.connect(lambda _i: self._apply_from_combo())
+        fbar.addWidget(self.filter_combo, 1)
+        outer.addLayout(fbar)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
@@ -2165,19 +2231,72 @@ class MetadataWindow(QWidget):
         self.v.setContentsMargins(8, 8, 8, 8)
         self.v.setSpacing(6)
 
+        self._tables = []
+        self._trees = []
         ci = 0
         for name, rows in meta["sections"]:
             self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
-            self.v.addWidget(self._kv_table(rows))
+            t = self._kv_table(rows)
+            self._tables.append(t)
+            self.v.addWidget(t)
             ci += 1
         for name, obj in meta["json_sections"]:
             self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
-            self.v.addWidget(self._json_tree(obj))
+            tree = self._json_tree(obj)
+            self._trees.append(tree)
+            self.v.addWidget(tree)
             ci += 1
         self.v.addStretch()
 
         scroll.setWidget(content)
         outer.addWidget(scroll)
+
+    # ---- フィルタ ----
+    def _reload_filter_combo(self, current=None):
+        if current is None:
+            current = self.filter_combo.currentText()
+        self.filter_combo.blockSignals(True)
+        self.filter_combo.clear()
+        self.filter_combo.addItems(load_filter_history())
+        self.filter_combo.setCurrentText(current)
+        self.filter_combo.blockSignals(False)
+
+    def _apply_from_combo(self):
+        text = self.filter_combo.currentText().strip()
+        if text:
+            push_filter_history(text)
+            self._reload_filter_combo(current=text)
+        self._apply_filter(text)
+
+    def _apply_filter(self, text):
+        patterns = _filter_patterns(text)
+        for t in self._tables:
+            for r in range(t.rowCount()):
+                key_item = t.item(r, 0)
+                key = key_item.text() if key_item else ""
+                t.setRowHidden(r, not _key_matches(key, patterns))
+            self._resize_table(t)
+        for tree in self._trees:
+            for i in range(tree.topLevelItemCount()):
+                self._filter_tree_item(tree.topLevelItem(i), patterns)
+
+    def _filter_tree_item(self, item, patterns):
+        if not patterns or _key_matches(item.text(0), patterns):
+            item.setHidden(False)
+            self._show_subtree(item)
+            return True
+        any_child = False
+        for i in range(item.childCount()):
+            if self._filter_tree_item(item.child(i), patterns):
+                any_child = True
+        item.setHidden(not any_child)
+        return any_child
+
+    def _show_subtree(self, item):
+        for i in range(item.childCount()):
+            c = item.child(i)
+            c.setHidden(False)
+            self._show_subtree(c)
 
     def _header(self, text, color):
         lab = QLabel(text)
@@ -2206,9 +2325,13 @@ class MetadataWindow(QWidget):
         t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         t.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         t.resizeRowsToContents()
-        h = sum(t.rowHeight(r) for r in range(t.rowCount())) + 4
-        t.setFixedHeight(max(h, 24))
+        self._resize_table(t)
         return t
+
+    def _resize_table(self, t):
+        h = sum(t.rowHeight(r) for r in range(t.rowCount())
+                if not t.isRowHidden(r)) + 4
+        t.setFixedHeight(max(h, 24))
 
     def _json_tree(self, obj):
         tree = QTreeWidget()
