@@ -10,6 +10,7 @@ import ctypes
 import shutil
 import re
 import time
+import struct
 import warnings
 
 # PySide6 では QWidget.exec_() が非推奨だが、PySide2(Maya2024以前)は exec_() のみ。
@@ -29,7 +30,7 @@ try:
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
-        QListWidget, QListWidgetItem
+        QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide6.QtGui import (
         QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
@@ -47,7 +48,7 @@ except ImportError:
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
-        QListWidget, QListWidgetItem
+        QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide2.QtGui import (
         QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
@@ -1928,6 +1929,342 @@ class SeqFileModel(QAbstractTableModel):
         return list(e.paths) if e else []
 
 
+# ============================================================
+#  メタデータ表示（静止画/動画）
+# ============================================================
+IMAGE_EXTS = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".dpx",
+              ".tga", ".bmp", ".hdr", ".tx", ".psd", ".gif", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mxf", ".wmv"}
+METADATA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+_EXR_COMPRESSION = {0: "none", 1: "RLE", 2: "ZIPS", 3: "ZIP", 4: "PIZ",
+                    5: "PXR24", 6: "B44", 7: "B44A", 8: "DWAA", 9: "DWAB"}
+_EXR_PIXELTYPE = {0: "uint", 1: "half", 2: "float"}
+_EXR_LINEORDER = {0: "increasing Y", 1: "decreasing Y", 2: "random Y"}
+
+
+def _read_cstr(f):
+    out = bytearray()
+    while True:
+        b = f.read(1)
+        if not b or b == b"\x00":
+            break
+        out += b
+    return out.decode("utf-8", "replace")
+
+
+def read_exr_header(path):
+    """EXRヘッダーを外部依存なしで読む。 -> [(name, type, raw_bytes), ...]"""
+    attrs = []
+    with open(path, "rb") as f:
+        if f.read(4) != b"\x76\x2f\x31\x01":
+            raise ValueError("EXR形式ではありません")
+        f.read(4)  # version
+        while True:
+            name = _read_cstr(f)
+            if name == "":
+                break
+            atype = _read_cstr(f)
+            raw = f.read(4)
+            if len(raw) < 4:
+                break
+            size = struct.unpack("<i", raw)[0]
+            if size < 0 or size > 50_000_000:
+                break
+            attrs.append((name, atype, f.read(size)))
+    return attrs
+
+
+def _parse_chlist(value):
+    chans, i = [], 0
+    while i < len(value):
+        j = value.find(b"\x00", i)
+        if j == -1:
+            break
+        nm = value[i:j].decode("utf-8", "replace")
+        i = j + 1
+        if nm == "":
+            break
+        if i + 16 > len(value):
+            break
+        ptype = struct.unpack("<i", value[i:i + 4])[0]
+        i += 16
+        chans.append(f"{nm}({_EXR_PIXELTYPE.get(ptype, ptype)})")
+    return chans
+
+
+def _decode_exr_attr(atype, value):
+    try:
+        if atype == "string":
+            return value.decode("utf-8", "replace")
+        if atype == "int":
+            return str(struct.unpack("<i", value[:4])[0])
+        if atype == "float":
+            return f"{struct.unpack('<f', value[:4])[0]:g}"
+        if atype == "double":
+            return f"{struct.unpack('<d', value[:8])[0]:g}"
+        if atype == "box2i":
+            v = struct.unpack("<4i", value[:16])
+            return f"({v[0]}, {v[1]}) - ({v[2]}, {v[3]})"
+        if atype == "box2f":
+            v = struct.unpack("<4f", value[:16])
+            return f"({v[0]:g}, {v[1]:g}) - ({v[2]:g}, {v[3]:g})"
+        if atype in ("v2i",):
+            v = struct.unpack("<2i", value[:8])
+            return f"{v[0]}, {v[1]}"
+        if atype in ("v2f",):
+            v = struct.unpack("<2f", value[:8])
+            return f"{v[0]:g}, {v[1]:g}"
+        if atype in ("v3i",):
+            v = struct.unpack("<3i", value[:12])
+            return f"{v[0]}, {v[1]}, {v[2]}"
+        if atype in ("v3f",):
+            v = struct.unpack("<3f", value[:12])
+            return f"{v[0]:g}, {v[1]:g}, {v[2]:g}"
+        if atype == "compression":
+            return _EXR_COMPRESSION.get(value[0], f"unknown({value[0]})") if value else ""
+        if atype == "lineOrder":
+            return _EXR_LINEORDER.get(value[0], str(value[0])) if value else ""
+        if atype == "chlist":
+            return ", ".join(_parse_chlist(value))
+        if atype == "rational":
+            n, d = struct.unpack("<iI", value[:8])
+            return f"{n}/{d}"
+    except Exception:
+        pass
+    return f"<{atype}, {len(value)} bytes>"
+
+
+def find_ffprobe():
+    for name in ("ffprobe", "hffprobe"):
+        cand = shutil.which(name)
+        if cand:
+            return cand
+    hfs = os.environ.get("HFS", "")
+    if hfs:
+        for name in ("ffprobe.exe", "hffprobe.exe"):
+            p = os.path.join(hfs, "bin", name)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _extract_exr(path, result):
+    attrs = read_exr_header(path)
+    img_rows, meta_rows = [], []
+    for name, atype, val in attrs:
+        if name == "dataWindow" and atype == "box2i":
+            x0, y0, x1, y1 = struct.unpack("<4i", val[:16])
+            img_rows.append(("解像度", f"{x1 - x0 + 1} x {y1 - y0 + 1}"))
+        decoded = _decode_exr_attr(atype, val)
+        if atype == "string":
+            s = decoded.strip()
+            if s[:1] in "{[":
+                try:
+                    result["json_sections"].append((name, json.loads(s)))
+                    continue
+                except ValueError:
+                    pass
+        meta_rows.append((name, decoded))
+    if img_rows:
+        result["sections"].append(("画像", img_rows))
+    result["sections"].append(("EXR ヘッダー", meta_rows))
+
+
+def _extract_video(path, result):
+    exe = find_ffprobe()
+    if not exe:
+        result["sections"].append(
+            ("動画", [("情報", "ffprobe が見つかりません（$HFS/bin か PATH に必要）")]))
+        return
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        out = subprocess.run(
+            [exe, "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, creationflags=flags)
+        data = json.loads(out.stdout or "{}")
+    except Exception as ex:
+        result["sections"].append(("動画", [("エラー", str(ex))]))
+        return
+    fmt = data.get("format", {})
+    summary = []
+    dur = fmt.get("duration")
+    if dur:
+        try:
+            summary.append(("長さ", f"{float(dur):.2f} 秒"))
+        except ValueError:
+            pass
+    if fmt.get("bit_rate"):
+        try:
+            summary.append(("ビットレート", f"{int(fmt['bit_rate']) // 1000} kbps"))
+        except ValueError:
+            pass
+    for st in data.get("streams", []):
+        if st.get("codec_type") == "video":
+            summary.append(("解像度", f"{st.get('width')} x {st.get('height')}"))
+            summary.append(("コーデック", st.get("codec_name", "")))
+            fr = st.get("r_frame_rate", "")
+            if "/" in fr:
+                a, b = fr.split("/")
+                if float(b or 0):
+                    summary.append(("フレームレート", f"{float(a) / float(b):.3f} fps"))
+            break
+    if summary:
+        result["sections"].append(("動画", summary))
+    result["json_sections"].append(("ffprobe", data))
+
+
+def extract_metadata(path):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        st = os.stat(path)
+        file_rows = [("パス", os.path.normpath(path).replace("\\", "/")),
+                     ("サイズ", human_size(st.st_size)),
+                     ("更新日時", format_mtime(st.st_mtime))]
+    except OSError:
+        file_rows = [("パス", path)]
+    result = {"title": os.path.basename(path), "ext": ext,
+              "sections": [("ファイル", file_rows)], "json_sections": []}
+    if ext == ".exr":
+        _extract_exr(path, result)
+    elif ext in VIDEO_EXTS:
+        _extract_video(path, result)
+    else:
+        result["sections"].append(
+            ("画像", [("形式", ext.lstrip(".").upper() + " ファイル")]))
+    return result
+
+
+_SECTION_COLORS = ["#4a90e2", "#50b060", "#c86fc9", "#e0913a", "#3aa8a8", "#b0554a"]
+_METADATA_WINDOWS = []  # 参照保持（GC/複数比較用）
+
+
+class MetadataWindow(QWidget):
+    """カラフルなメタデータ表示。複数同時に開いて比較できる独立ウィンドウ。"""
+    def __init__(self, meta):
+        super().__init__()
+        self.setWindowTitle(f"メタデータ - {meta['title']}")
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.resize(540, 660)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel(meta["title"])
+        title.setStyleSheet(
+            "font-weight:bold; font-size:13pt; padding:8px 10px;"
+            "background:#2d2d2d; color:#ffffff;")
+        title.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        outer.addWidget(title)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        self.v = QVBoxLayout(content)
+        self.v.setContentsMargins(8, 8, 8, 8)
+        self.v.setSpacing(6)
+
+        ci = 0
+        for name, rows in meta["sections"]:
+            self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
+            self.v.addWidget(self._kv_table(rows))
+            ci += 1
+        for name, obj in meta["json_sections"]:
+            self.v.addWidget(self._header(name, _SECTION_COLORS[ci % len(_SECTION_COLORS)]))
+            self.v.addWidget(self._json_tree(obj))
+            ci += 1
+        self.v.addStretch()
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+    def _header(self, text, color):
+        lab = QLabel(text)
+        lab.setStyleSheet(
+            f"background:{color}; color:#ffffff; font-weight:bold;"
+            "padding:4px 8px; border-radius:3px;")
+        return lab
+
+    def _kv_table(self, rows):
+        t = QTableWidget(len(rows), 2)
+        t.horizontalHeader().setVisible(False)
+        t.verticalHeader().setVisible(False)
+        t.setShowGrid(False)
+        t.setAlternatingRowColors(True)
+        t.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        t.setWordWrap(True)
+        t.setSelectionMode(QAbstractItemView.NoSelection)
+        for r, (k, val) in enumerate(rows):
+            ki = QTableWidgetItem(str(k))
+            f = ki.font()
+            f.setBold(True)
+            ki.setFont(f)
+            ki.setForeground(QColor("#6cb0ff") if DARK_MODE else QColor("#1f5fb0"))
+            t.setItem(r, 0, ki)
+            t.setItem(r, 1, QTableWidgetItem(str(val)))
+        t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        t.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        t.resizeRowsToContents()
+        h = sum(t.rowHeight(r) for r in range(t.rowCount())) + 4
+        t.setFixedHeight(max(h, 24))
+        return t
+
+    def _json_tree(self, obj):
+        tree = QTreeWidget()
+        tree.setColumnCount(2)
+        tree.setHeaderLabels(["キー", "値"])
+        tree.setAlternatingRowColors(True)
+        key_color = QColor("#6cb0ff") if DARK_MODE else QColor("#1f5fb0")
+
+        def add(parent, key, val):
+            if isinstance(val, dict):
+                node = QTreeWidgetItem([str(key), ""])
+                for k, v in val.items():
+                    add(node, k, v)
+            elif isinstance(val, (list, tuple)):
+                node = QTreeWidgetItem([str(key), f"[{len(val)}]"])
+                for i, v in enumerate(val):
+                    add(node, i, v)
+            else:
+                node = QTreeWidgetItem([str(key), str(val)])
+            node.setForeground(0, key_color)
+            if isinstance(parent, QTreeWidget):
+                parent.addTopLevelItem(node)
+            else:
+                parent.addChild(node)
+
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                add(tree, k, v)
+        else:
+            add(tree, "root", obj)
+        tree.expandAll()
+        tree.resizeColumnToContents(0)
+        tree.setMinimumHeight(200)
+        return tree
+
+
+def open_metadata_window(path):
+    try:
+        meta = extract_metadata(path)
+    except Exception as e:
+        QMessageBox.warning(None, "エラー", f"メタデータを読めませんでした:\n{e}")
+        return
+    win = MetadataWindow(meta)
+    n = len(_METADATA_WINDOWS)
+    win.move(140 + (n % 6) * 30, 120 + (n % 6) * 30)
+    _METADATA_WINDOWS.append(win)
+
+    def _drop(*_a):
+        if win in _METADATA_WINDOWS:
+            _METADATA_WINDOWS.remove(win)
+    win.destroyed.connect(_drop)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+
+
 class ExplorerPanel(QWidget):
     """右側に埋め込むファイルブラウザ（名前/サイズ/更新日時、連番まとめ対応）"""
     def __init__(self):
@@ -2187,11 +2524,14 @@ class ExplorerPanel(QWidget):
         act_rename = act_openwith = act_extract = None
         sendto_actions = {}
 
+        act_metadata = None
         if is_item:
             if not is_seq:  # 連番のまとめ行はリネーム対象外
                 act_rename = menu.addAction("名前を変更")
             if not is_dir:
                 act_openwith = menu.addAction("プログラムから開く")
+            if not is_dir and entry.ext in METADATA_EXTS:
+                act_metadata = menu.addAction("メタデータの表示")
             if is_archive(item_path):
                 act_extract = menu.addAction("その場で解凍")
             send_menu = menu.addMenu("送る")
@@ -2243,6 +2583,8 @@ class ExplorerPanel(QWidget):
                 self._rename(item_path)
             elif action is not None and action == act_openwith:
                 open_with_dialog(item_path)
+            elif act_metadata is not None and action == act_metadata:
+                open_metadata_window(item_path)
             elif act_extract is not None and action == act_extract:
                 extract_archive_here(item_path)
                 self.model.reload()
