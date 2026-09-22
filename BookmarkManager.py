@@ -2688,8 +2688,6 @@ class ExplorerPanel(QWidget):
                 act_rename = menu.addAction("名前を変更")
             if not is_dir:
                 act_openwith = menu.addAction("プログラムから開く")
-            if not is_dir and entry.ext in METADATA_EXTS:
-                act_metadata = menu.addAction("メタデータの表示")
             if is_archive(item_path):
                 act_extract = menu.addAction("その場で解凍")
             send_menu = menu.addMenu("送る")
@@ -2730,6 +2728,8 @@ class ExplorerPanel(QWidget):
         act_delete = menu.addAction("削除") if is_item else None
         if is_item:
             menu.addSeparator()
+        if is_item and not is_dir and entry.ext in METADATA_EXTS:
+            act_metadata = menu.addAction("メタデータの表示")
         act_props = menu.addAction("プロパティ")
 
         action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
