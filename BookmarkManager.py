@@ -1491,6 +1491,22 @@ def unique_path(dir_path, base_name):
         i += 1
 
 
+def _unique_copy_name(dir_path, src_name):
+    """同じフォルダへのコピー用に name_copy1.ext のような別名を返す。
+    既に _copyN が付いていれば番号を増やす。"""
+    base, ext = os.path.splitext(src_name)
+    m = re.match(r"^(.*)_copy(\d+)$", base)
+    if m:
+        root, i = m.group(1), int(m.group(2)) + 1
+    else:
+        root, i = base, 1
+    while True:
+        candidate = f"{root}_copy{i}{ext}"
+        if not os.path.exists(os.path.join(dir_path, candidate)):
+            return candidate
+        i += 1
+
+
 FO_MOVE, FO_COPY, FO_DELETE = 1, 2, 3
 FOF_ALLOWUNDO = 0x0040
 FOF_NOCONFIRMATION = 0x0010
@@ -2598,9 +2614,10 @@ class ExplorerPanel(QWidget):
             msg = "次の項目をごみ箱へ移動しますか？\n\n" + os.path.normpath(paths[0])
         else:
             msg = f"{len(paths)} 個の項目をごみ箱へ移動しますか？"
+        # Enter で確定（既定ボタンを Yes に）
         reply = QMessageBox.question(
             self, "削除の確認", msg,
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if reply != QMessageBox.Yes:
             return
         try:
@@ -2655,8 +2672,22 @@ class ExplorerPanel(QWidget):
             raw = bytes(md.data("Preferred DropEffect"))
             if len(raw) >= 4 and int.from_bytes(raw[:4], "little") == 2:
                 cut = True
+        destn = os.path.normpath(dest_dir)
+        # コピーで元と同じフォルダに貼る場合は _copyN の別名で複製
+        same_dir = [] if cut else [
+            s for s in sources
+            if os.path.normpath(os.path.dirname(s)) == destn]
+        others = [s for s in sources if s not in same_dir]
         try:
-            shell_copy_move(sources, dest_dir, move=cut)
+            for s in same_dir:
+                new_name = _unique_copy_name(dest_dir, os.path.basename(os.path.normpath(s)))
+                dst = os.path.join(dest_dir, new_name)
+                if os.path.isdir(s):
+                    shutil.copytree(s, dst)
+                else:
+                    shutil.copy2(s, dst)
+            if others:
+                shell_copy_move(others, dest_dir, move=cut)
             if cut:
                 QApplication.clipboard().clear()
         except Exception as e:
