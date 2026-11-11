@@ -1067,6 +1067,7 @@ class ProjectTab(QWidget):
         self.add_bookmark_button = QToolButton()
         self.remove_bookmark_button = QToolButton()
         self.sort_bookmark_button = QToolButton()
+        self.reload_button = QToolButton()
         self.new_project_button = QToolButton()
         self.settings_button = QToolButton()
 
@@ -1074,15 +1075,17 @@ class ProjectTab(QWidget):
         self.add_bookmark_button.setText("＋")
         self.remove_bookmark_button.setText("－")
         self.sort_bookmark_button.setText("⇅")
+        self.reload_button.setText("↻")
         self.new_project_button.setText("⊞")
         self.settings_button.setText("⚙")
         for b in (self.add_bookmark_button, self.remove_bookmark_button,
-                  self.sort_bookmark_button, self.new_project_button,
-                  self.settings_button):
+                  self.sort_bookmark_button, self.reload_button,
+                  self.new_project_button, self.settings_button):
             b.setFixedSize(26, 24)
         self.add_bookmark_button.setToolTip("ブックマーク追加")
         self.remove_bookmark_button.setToolTip("選択を削除 (Delキー)")
         self.sort_bookmark_button.setToolTip("名前で並べ替え")
+        self.reload_button.setToolTip("ボタンのアイコンを再読み込み（ネットワーク接続後）")
         self.new_project_button.setToolTip("新規プロジェクト")
         self.settings_button.setToolTip("設定")
 
@@ -1090,6 +1093,7 @@ class ProjectTab(QWidget):
         self.bookmark_button_layout.addWidget(self.remove_bookmark_button)
         self.bookmark_button_layout.addWidget(self.sort_bookmark_button)
         self.bookmark_button_layout.addStretch()
+        self.bookmark_button_layout.addWidget(self.reload_button)
         self.bookmark_button_layout.addWidget(self.new_project_button)
         self.bookmark_button_layout.addWidget(self.settings_button)
         self.layout.addLayout(self.bookmark_button_layout)
@@ -1099,11 +1103,17 @@ class ProjectTab(QWidget):
         self.add_bookmark_button.clicked.connect(self.add_bookmark)
         self.remove_bookmark_button.clicked.connect(self.table.delete_selected_rows)
         self.sort_bookmark_button.clicked.connect(self.sort_bookmarks)
+        self.reload_button.clicked.connect(self.reload_buttons)
         self.new_project_button.clicked.connect(self.add_project_callback)
         self.settings_button.clicked.connect(lambda: self.open_settings_callback(self))
 
         self.load_bookmarks()
         self.initializing = False
+
+    def reload_buttons(self):
+        """ボタンのアイコンを取り直す（起動時に未マウントだったパス対策）。"""
+        for btn in self.mini_buttons:
+            btn.set_button_label(btn.current_label)
 
     # ---------- ep/sq/shot ----------
     def load_ep_sq_shot(self):
