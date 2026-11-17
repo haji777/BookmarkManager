@@ -34,7 +34,7 @@ try:
         QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide6.QtGui import (
-        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter
     )
     from PySide6.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
@@ -52,7 +52,7 @@ except ImportError:
         QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide2.QtGui import (
-        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter
     )
     from PySide2.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
@@ -987,6 +987,146 @@ class BookmarkTableWidget(QTableWidget):
 
 
 # ============================================================
+#  マウント済みドライブ一覧（使用量ゲージ付き）
+# ============================================================
+def _drive_display_name(root):
+    """Explorer 風の表示名（例: ローカル ディスク (C:)）を取得。"""
+    try:
+        from ctypes import wintypes
+
+        class SHFILEINFOW(ctypes.Structure):
+            _fields_ = [
+                ("hIcon", wintypes.HANDLE),
+                ("iIcon", ctypes.c_int),
+                ("dwAttributes", wintypes.DWORD),
+                ("szDisplayName", ctypes.c_wchar * 260),
+                ("szTypeName", ctypes.c_wchar * 80),
+            ]
+        SHGFI_DISPLAYNAME = 0x00000200
+        info = SHFILEINFOW()
+        ctypes.windll.shell32.SHGetFileInfoW(
+            root, 0, ctypes.byref(info), ctypes.sizeof(info), SHGFI_DISPLAYNAME)
+        if info.szDisplayName:
+            return info.szDisplayName
+    except Exception:
+        pass
+    return None
+
+
+def list_drives():
+    """マウント済みドライブを列挙。 -> [{root, letter, display, used, total}, ...]"""
+    drives = []
+    try:
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        return drives
+    for i in range(26):
+        if not (bitmask >> i) & 1:
+            continue
+        letter = chr(ord("A") + i)
+        root = f"{letter}:\\"
+        display = _drive_display_name(root) or f"{letter}:"
+        used = total = None
+        try:
+            du = shutil.disk_usage(root)
+            total, used = du.total, du.used
+        except Exception:
+            pass
+        drives.append({"root": root, "letter": letter, "display": display,
+                       "used": used, "total": total})
+    return drives
+
+
+class DriveRow(QWidget):
+    """アイコン + 表示名 + 使用量ゲージ（背景塗り）の1行。クリックで開く。"""
+    ROW_H = 24
+
+    def __init__(self, info, on_open):
+        super().__init__()
+        self.info = info
+        self.on_open = on_open
+        self._hover = False
+        self.setFixedHeight(self.ROW_H)
+        self.setCursor(Qt.PointingHandCursor)
+        total = info.get("total")
+        used = info.get("used")
+        pct = (used / total * 100) if (total and used is not None) else None
+        tip = info["display"]
+        if pct is not None:
+            tip += f"  {human_size(used)} / {human_size(total)} ({pct:.0f}%)"
+        self.setToolTip(tip)
+        self._pixmap = QFileIconProvider().icon(
+            QFileInfo(info["root"])).pixmap(16, 16)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.on_open:
+            self.on_open(self.info["root"])
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        rect = self.rect()
+        total = self.info.get("total")
+        used = self.info.get("used")
+        # 使用量ゲージ（背景塗り）
+        if total and used is not None and total > 0:
+            frac = max(0.0, min(1.0, used / total))
+            gw = int(rect.width() * frac)
+            pct = frac * 100
+            if pct >= 90:
+                col = QColor(200, 70, 60, 110)
+            elif pct >= 75:
+                col = QColor(210, 150, 50, 110)
+            else:
+                col = QColor(70, 150, 90, 100)
+            p.fillRect(0, 0, gw, rect.height(), col)
+        if self._hover:
+            p.fillRect(rect, QColor(255, 255, 255, 24) if DARK_MODE
+                       else QColor(0, 0, 0, 18))
+        # アイコン
+        if self._pixmap and not self._pixmap.isNull():
+            p.drawPixmap(4, (rect.height() - 16) // 2, self._pixmap)
+        # 表示名
+        p.setPen(QColor(235, 235, 235) if DARK_MODE else QColor(30, 30, 30))
+        p.drawText(26, 0, rect.width() - 30, rect.height(),
+                   int(Qt.AlignVCenter | Qt.AlignLeft), self.info["display"])
+        # 幅に余裕があれば 使用量/総容量 を右に表示
+        if total and used is not None and rect.width() >= 260:
+            s = f"{human_size(used)} / {human_size(total)}"
+            p.setPen(QColor(200, 200, 200) if DARK_MODE else QColor(80, 80, 80))
+            p.drawText(rect.width() - 160, 0, 156, rect.height(),
+                       int(Qt.AlignVCenter | Qt.AlignRight), s)
+        p.end()
+
+
+class DrivesWidget(QWidget):
+    """マウント済みドライブの一覧。"""
+    def __init__(self, on_open):
+        super().__init__()
+        self.on_open = on_open
+        self._v = QVBoxLayout(self)
+        self._v.setContentsMargins(0, 2, 0, 0)
+        self._v.setSpacing(1)
+        self.refresh()
+
+    def refresh(self):
+        while self._v.count():
+            item = self._v.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for info in list_drives():
+            self._v.addWidget(DriveRow(info, self.on_open))
+
+
+# ============================================================
 #  プロジェクトタブ
 # ============================================================
 class ProjectTab(QWidget):
@@ -1061,6 +1201,10 @@ class ProjectTab(QWidget):
         self.table = BookmarkTableWidget(self)
         self.layout.addWidget(self.table)
 
+        # --- マウント済みドライブ一覧（ブックマークの下） ---
+        self.drives_widget = DrivesWidget(self._open_drive)
+        self.layout.addWidget(self.drives_widget)
+
         # --- 操作ボタン列 ---
         self.bookmark_button_layout = QHBoxLayout()
         self.bookmark_button_layout.setSpacing(4)
@@ -1085,7 +1229,7 @@ class ProjectTab(QWidget):
         self.add_bookmark_button.setToolTip("ブックマーク追加")
         self.remove_bookmark_button.setToolTip("選択を削除 (Delキー)")
         self.sort_bookmark_button.setToolTip("名前で並べ替え")
-        self.reload_button.setToolTip("ボタンのアイコンを再読み込み（ネットワーク接続後）")
+        self.reload_button.setToolTip("再読み込み（ボタンのアイコン・ドライブ使用量）")
         self.new_project_button.setToolTip("新規プロジェクト")
         self.settings_button.setToolTip("設定")
 
@@ -1111,9 +1255,15 @@ class ProjectTab(QWidget):
         self.initializing = False
 
     def reload_buttons(self):
-        """ボタンのアイコンを取り直す（起動時に未マウントだったパス対策）。"""
+        """ボタンのアイコンを取り直す（起動時に未マウントだったパス対策）。
+        ドライブ一覧（使用量）も更新する。"""
         for btn in self.mini_buttons:
             btn.set_button_label(btn.current_label)
+        self.drives_widget.refresh()
+
+    def _open_drive(self, root):
+        if self.show_in_explorer_callback:
+            self.show_in_explorer_callback(root)
 
     # ---------- ep/sq/shot ----------
     def load_ep_sq_shot(self):
