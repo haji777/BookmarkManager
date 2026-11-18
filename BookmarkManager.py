@@ -27,7 +27,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView,
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
-        QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
+        QTabWidget, QTabBar, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
@@ -38,14 +38,14 @@ try:
     )
     from PySide6.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
-        QAbstractTableModel, QFileSystemWatcher
+        QAbstractTableModel, QFileSystemWatcher, QTimer
     )
     PYSIDE = 6
 except ImportError:
     from PySide2.QtWidgets import (
         QApplication, QWidget, QVBoxLayout, QHBoxLayout, QAbstractItemView,
         QPushButton, QComboBox, QFileDialog, QInputDialog, QMessageBox,
-        QTabWidget, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
+        QTabWidget, QTabBar, QMenu, QColorDialog, QTableWidget, QTableWidgetItem,
         QHeaderView, QDialog, QLineEdit, QSpinBox, QLabel, QFormLayout,
         QDialogButtonBox, QRadioButton, QGroupBox, QToolButton, QFileIconProvider,
         QSizePolicy, QTreeView, QSplitter, QFileSystemModel, QCheckBox,
@@ -56,7 +56,7 @@ except ImportError:
     )
     from PySide2.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
-        QAbstractTableModel, QFileSystemWatcher
+        QAbstractTableModel, QFileSystemWatcher, QTimer
     )
     PYSIDE = 2
 
@@ -689,10 +689,25 @@ class ConfigurableButton(QPushButton):
         set_path_action = menu.addAction("パスを指定")
         edit_path_action = menu.addAction("パスを編集")
         set_label_action = menu.addAction("ボタンラベルを設定")
+
+        # 他のプロジェクトへ移動（中身のあるボタンのみ）
+        move_actions = {}
+        pm = getattr(self.project_tab, "project_manager", None)
+        if (self.program_path or self.icon_path) and pm is not None:
+            others = pm.other_projects(self.project_tab)
+            if others:
+                move_menu = menu.addMenu("他のプロジェクトへ移動")
+                for name, tab in others:
+                    move_actions[move_menu.addAction(name)] = tab
+
         menu.addSeparator()
         clear_action = menu.addAction("ボタンをクリア")
 
         action = menu.exec_(self.mapToGlobal(pos))
+
+        if action in move_actions:
+            self._move_to_project(move_actions[action])
+            return
 
         if action == set_path_action:
             new_path, _ = QFileDialog.getOpenFileName(
@@ -734,6 +749,35 @@ class ConfigurableButton(QPushButton):
                 self.update_callback("icon", "")
                 self.update_callback("label", default_label)
 
+    def _move_to_project(self, target_tab):
+        """このボタンの設定を別プロジェクトの空きスロットへ移動する。"""
+        buttons = target_tab.project_data.get("buttons", [])
+        slot = next((i for i in range(len(target_tab.mini_buttons))
+                     if not buttons[i].get("program") and not buttons[i].get("icon")),
+                    None)
+        if slot is None:
+            QMessageBox.information(
+                self, "確認",
+                f"「{target_tab.proj}」に空きボタンがありません。")
+            return
+        # 移動先へ設定をコピー
+        tbtn = target_tab.mini_buttons[slot]
+        tbtn.program_path = self.program_path
+        tbtn.icon_path = self.icon_path
+        tbtn.set_button_label(self.current_label)
+        target_tab.update_button_setting(slot, "program", self.program_path)
+        target_tab.update_button_setting(slot, "icon", self.icon_path)
+        target_tab.update_button_setting(slot, "label", self.current_label)
+        # 移動元をクリア
+        default_label = f"ボタン{self.button_index + 1}"
+        self.program_path = ""
+        self.icon_path = ""
+        self.set_button_label(default_label)
+        if self.update_callback:
+            self.update_callback("program", "")
+            self.update_callback("icon", "")
+            self.update_callback("label", default_label)
+
 
 # ============================================================
 #  ブックマークテーブル（名前 | パス、行並べ替え/D&D追加/Del削除）
@@ -743,6 +787,10 @@ def _event_pos(event):
     if hasattr(event, "position"):
         return event.position().toPoint()
     return event.pos()
+
+
+# ブックマークをタブへドラッグしてプロジェクト間移動するための目印
+BOOKMARK_MIME = "application/x-bookmarkmanager-bookmarks"
 
 
 class BookmarkTableWidget(QTableWidget):
@@ -910,6 +958,29 @@ class BookmarkTableWidget(QTableWidget):
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"操作に失敗しました: {e}")
 
+    # ---------- ドラッグ開始（タブへドロップでプロジェクト間移動） ----------
+    def startDrag(self, supportedActions):
+        rows = sorted({i.row() for i in self.selectedIndexes()})
+        if not rows:
+            return
+        items = []
+        for r in rows:
+            name, path, color = self.row_data(r)
+            text = f"{name} | {path}" if path else name
+            items.append({"text": text, "color": color})
+        payload = json.dumps({
+            "source": self.parent_tab.project_data.get("name", ""),
+            "items": items,
+        })
+        md = QMimeData()
+        md.setData(BOOKMARK_MIME, payload.encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(md)
+        if hasattr(drag, "exec"):
+            drag.exec(Qt.MoveAction)
+        else:
+            drag.exec_(Qt.MoveAction)
+
     # ---------- キー操作 ----------
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
@@ -927,12 +998,43 @@ class BookmarkTableWidget(QTableWidget):
 
     # ---------- コンテキストメニュー ----------
     def show_context_menu(self, pos):
-        row = self.rowAt(pos.y())
-        if row < 0:
+        clicked = self.rowAt(pos.y())
+        if clicked < 0:
             return
-        self.selectRow(row)
-        name, path, color = self.row_data(row)
+        sel = sorted({i.row() for i in self.selectedIndexes()})
+        # 選択外を右クリックしたらその行だけ選択、選択内ならそのまま
+        if clicked not in sel:
+            self.selectRow(clicked)
+            sel = [clicked]
+        if len(sel) > 1:
+            self._multi_context_menu(sel, pos)
+        else:
+            self._single_context_menu(clicked, pos)
 
+    def _multi_context_menu(self, rows, pos):
+        menu = QMenu(self)
+        color_action = menu.addAction(f"色の設定（{len(rows)}件）")
+        clear_color_action = menu.addAction("色をクリア")
+        menu.addSeparator()
+        delete_action = menu.addAction("削除")
+        action = menu.exec_(self.viewport().mapToGlobal(pos))
+        if action == color_action:
+            col = QColorDialog.getColor(parent=self)
+            if col.isValid():
+                for r in rows:
+                    name, path, _c = self.row_data(r)
+                    self._set_row(r, name, path, col.name())
+                self.parent_tab.commit_bookmarks()
+        elif action == clear_color_action:
+            for r in rows:
+                name, path, _c = self.row_data(r)
+                self._set_row(r, name, path, None)
+            self.parent_tab.commit_bookmarks()
+        elif action == delete_action:
+            self.delete_selected_rows()
+
+    def _single_context_menu(self, row, pos):
+        name, path, color = self.row_data(row)
         menu = QMenu(self)
         open_explorer_action = menu.addAction("エクスプローラで開く")
         menu.addSeparator()
@@ -1132,7 +1234,7 @@ class DrivesWidget(QWidget):
 class ProjectTab(QWidget):
     def __init__(self, project_data, add_project_callback, open_settings_callback,
                  source_path=None, show_in_explorer_callback=None,
-                 context_changed_callback=None):
+                 context_changed_callback=None, project_manager=None):
         super().__init__()
         self.initializing = True
         self.sort_ascending = True
@@ -1141,6 +1243,7 @@ class ProjectTab(QWidget):
         self.open_settings_callback = open_settings_callback
         self.show_in_explorer_callback = show_in_explorer_callback
         self.context_changed_callback = context_changed_callback
+        self.project_manager = project_manager
         self.source_path = source_path  # 読み込み元（共有プロジェクト用）
 
         self.proj = project_data.get("name", "blank_project")
@@ -3252,6 +3355,34 @@ class EpSqShotDialog(QDialog):
         return self.data
 
 
+class _ProjectTabBar(QTabBar):
+    """ブックマークをタブにドロップしてプロジェクト間移動できるタブバー。"""
+    def __init__(self, on_drop):
+        super().__init__()
+        self.on_drop = on_drop
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(BOOKMARK_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(BOOKMARK_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasFormat(BOOKMARK_MIME):
+            idx = self.tabAt(_event_pos(event))
+            self.on_drop(idx, event.mimeData())
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+
 class ProjectManager(QWidget):
     def __init__(self):
         super().__init__()
@@ -3264,6 +3395,7 @@ class ProjectManager(QWidget):
         self.layout.setSpacing(4)
 
         self.tab_widget = QTabWidget()
+        self.tab_widget.setTabBar(_ProjectTabBar(self._drop_bookmarks_on_tab))
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.setMovable(True)  # タブをドラッグで並べ替え
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
@@ -3324,11 +3456,44 @@ class ProjectManager(QWidget):
         tab = ProjectTab(data, self.add_new_project, self.open_settings,
                          source_path=source_path,
                          show_in_explorer_callback=self.show_in_explorer,
-                         context_changed_callback=self.refresh_explorer_for)
+                         context_changed_callback=self.refresh_explorer_for,
+                         project_manager=self)
         name = data.get("name", "Unnamed")
         self.tab_widget.addTab(tab, name)
         self.project_tabs[name] = tab
         return tab
+
+    def other_projects(self, exclude_tab):
+        """exclude_tab 以外のプロジェクト [(name, tab), ...] を表示順で返す。"""
+        out = []
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, ProjectTab) and tab is not exclude_tab:
+                out.append((self.tab_widget.tabText(i), tab))
+        return out
+
+    def _drop_bookmarks_on_tab(self, target_index, mime):
+        """ブックマークを別タブへドロップ → プロジェクト間移動。"""
+        if target_index < 0:
+            return
+        target_tab = self.tab_widget.widget(target_index)
+        if not isinstance(target_tab, ProjectTab):
+            return
+        try:
+            payload = json.loads(bytes(mime.data(BOOKMARK_MIME)).decode("utf-8"))
+        except Exception:
+            return
+        source_tab = self.project_tabs.get(payload.get("source"))
+        if target_tab is source_tab:
+            return
+        items = payload.get("items", [])
+        for it in items:
+            name, path = ProjectTab._split_text(it.get("text", ""))
+            target_tab.table.append_row(name, path, it.get("color"))
+        target_tab.commit_bookmarks()
+        # 移動元から削除（ドラッグ処理中なので、ループが解けてから実行）
+        if isinstance(source_tab, ProjectTab):
+            QTimer.singleShot(0, source_tab.table.delete_selected_rows)
 
     def show_in_explorer(self, resolved_path, template=None, owner_tab=None):
         """ブックマークのダブルクリックで右側パネルにフォルダを表示"""
