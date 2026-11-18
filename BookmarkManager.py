@@ -791,6 +791,14 @@ def _event_pos(event):
 
 # ブックマークをタブへドラッグしてプロジェクト間移動するための目印
 BOOKMARK_MIME = "application/x-bookmarkmanager-bookmarks"
+# パンくずボタンをブックマーク表へドラッグして登録するための目印
+PATH_BUTTON_MIME = "application/x-bookmarkmanager-path-button"
+
+
+def path_bookmark_name(path):
+    """ブックマーク名の既定値。ドライブ直下 (C:\\) は "C:" にする。"""
+    p = os.path.normpath(path)
+    return os.path.basename(p) or os.path.splitdrive(p)[0] or p
 
 
 class BookmarkTableWidget(QTableWidget):
@@ -863,14 +871,19 @@ class BookmarkTableWidget(QTableWidget):
                     it.setBackground(brush)
 
     # ---------- ドラッグ＆ドロップ ----------
+    def _accepts_drag(self, event):
+        md = event.mimeData()
+        return (event.source() is self or md.hasUrls()
+                or md.hasFormat(PATH_BUTTON_MIME))
+
     def dragEnterEvent(self, event):
-        if event.source() is self or event.mimeData().hasUrls():
+        if self._accepts_drag(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):
-        if event.source() is self or event.mimeData().hasUrls():
+        if self._accepts_drag(event):
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -906,6 +919,17 @@ class BookmarkTableWidget(QTableWidget):
                 self.selectRow(drop_row + i)
             self.parent_tab.commit_bookmarks()
             event.acceptProposedAction()
+        elif event.mimeData().hasFormat(PATH_BUTTON_MIME):
+            # --- パンくずボタンのドロップ → 落とした位置にブックマーク登録 ---
+            path = bytes(event.mimeData().data(PATH_BUTTON_MIME)).decode("utf-8")
+            if path:
+                row = self._drop_row_index(event)
+                self.insertRow(row)
+                self._set_row(row, path_bookmark_name(path),
+                              os.path.normpath(path).replace("\\", "/"))
+                self.parent_tab.commit_bookmarks()
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
         elif event.mimeData().hasUrls():
             md = event.mimeData()
             row = self.rowAt(_event_pos(event).y())
@@ -2738,7 +2762,47 @@ class _SegmentButton(QToolButton):
             f.setBold(True)
             self.setFont(f)
         self.setAcceptDrops(True)
+        self._press_pos = None
         self.clicked.connect(lambda: self.panel.set_root(self.path))
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._open_context_menu)
+
+    # ---- 右クリックメニュー ----
+    def _open_context_menu(self, pos):
+        menu = QMenu(self)
+        act_explorer = menu.addAction("エクスプローラで開く")
+        act_bookmark = menu.addAction("ブックマークに追加")
+        action = menu.exec_(self.mapToGlobal(pos))
+        if action == act_explorer:
+            if os.path.exists(self.path):
+                reveal_in_explorer(self.path)
+            else:
+                QMessageBox.warning(
+                    self, "エラー", "フォルダが見つかりません:\n" + self.path)
+        elif action == act_bookmark:
+            if self.panel.add_bookmark_callback:
+                self.panel.add_bookmark_callback(self.path)
+
+    # ---- ドラッグ開始（ブックマーク表へ落として登録） ----
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_pos = _event_pos(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_pos is not None and event.buttons() & Qt.LeftButton
+                and (_event_pos(event) - self._press_pos).manhattanLength()
+                >= QApplication.startDragDistance()):
+            self._press_pos = None
+            self.setDown(False)
+            md = QMimeData()
+            md.setData(PATH_BUTTON_MIME, self.path.encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(md)
+            drag.setPixmap(self.grab())
+            drag.exec_(Qt.CopyAction)
+            return
+        super().mouseMoveEvent(event)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
