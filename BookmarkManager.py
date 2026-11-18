@@ -2702,6 +2702,158 @@ def open_metadata_window(path):
     win.activateWindow()
 
 
+# ============================================================
+#  訪問パスのパンくず履歴バー
+# ============================================================
+def path_segments(path):
+    """パスを [(表示名, そこまでのフルパス), ...] に分解する。
+    C:\\Users\\a -> [("C:", "C:\\"), ("Users", "C:\\Users"), ("a", "C:\\Users\\a")]"""
+    p = os.path.normpath(path)
+    drive, rest = os.path.splitdrive(p)
+    cur = (drive + os.sep) if drive else os.sep
+    segs = [(drive or os.sep, cur)]
+    for s in rest.replace("/", os.sep).split(os.sep):
+        if s:
+            cur = os.path.join(cur, s)
+            segs.append((s, cur))
+    return segs
+
+
+def _segment_key(path):
+    return [os.path.normcase(name) for name, _p in path_segments(path)]
+
+
+class _SegmentButton(QToolButton):
+    """パンくずの1階層。クリックで移動、ファイルのドロップでコピー/移動。"""
+    def __init__(self, panel, label, path, current=False):
+        super().__init__()
+        self.panel = panel
+        self.path = path
+        self.setText(label)
+        self.setToolTip(path.replace("\\", "/"))
+        self.setFixedHeight(PathHistoryBar.ROW_H - 2)
+        self.setStyleSheet("QToolButton { padding: 1px 6px; }")
+        if current:
+            f = self.font()
+            f.setBold(True)
+            self.setFont(f)
+        self.setAcceptDrops(True)
+        self.clicked.connect(lambda: self.panel.set_root(self.path))
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        sources = [s for s in sources if s and os.path.exists(s)]
+        if sources and os.path.isdir(self.path):
+            self.panel.handle_external_drop(sources, self.path)
+        # コピー扱いにして、ドラッグ元側でファイルが消されないようにする
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+
+
+class PathHistoryBar(QScrollArea):
+    """訪問したパスを系統ごとに1行のボタン列で並べる。
+    同じ系統を深く潜ると行が伸び、別系統へ移ると行が増える。"""
+    ROW_H = 24
+    MAX_ROWS = 6
+
+    def __init__(self, panel):
+        super().__init__()
+        self.panel = panel
+        self._rows = []  # 各行の最深パス
+        self.setWidgetResizable(True)
+        self.setFrameShape(QScrollArea.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("QScrollArea { background: transparent; }")
+        self.viewport().setAutoFillBackground(False)
+        self._inner = QWidget()
+        self._inner.setAutoFillBackground(False)
+        self._v = QVBoxLayout(self._inner)
+        self._v.setContentsMargins(0, 0, 0, 0)
+        self._v.setSpacing(1)
+        self.setWidget(self._inner)
+        self.hide()
+
+    def rows(self):
+        return list(self._rows)
+
+    def visit(self, path):
+        if not path:
+            return
+        path = os.path.normpath(path)
+        new = _segment_key(path)
+        keys = [_segment_key(r) for r in self._rows]
+        if any(k[:len(new)] == new for k in keys):
+            pass  # 既存の行に含まれている（上の階層へ戻っただけ）
+        else:
+            for i, k in enumerate(keys):
+                if new[:len(k)] == k:  # 既存の行の続き → その行を伸ばす
+                    self._rows[i] = path
+                    break
+            else:
+                self._rows.append(path)  # 別系統 → 新しい行
+                if len(self._rows) > self.MAX_ROWS:
+                    self._rows.pop(0)
+        self._rebuild()
+
+    def remove_row(self, path):
+        self._rows = [r for r in self._rows if r != path]
+        self._rebuild()
+
+    def _rebuild(self):
+        while self._v.count():
+            w = self._v.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        current = os.path.normcase(os.path.normpath(self.panel.current_root or ""))
+        for row_path in self._rows:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(1)
+            close = QToolButton()
+            close.setText("✕")
+            close.setToolTip("この列を消す")
+            close.setFixedSize(20, self.ROW_H - 2)
+            close.setStyleSheet("QToolButton { padding: 0px; }")
+            close.clicked.connect(lambda _=False, p=row_path: self.remove_row(p))
+            h.addWidget(close)
+            for label, seg_path in path_segments(row_path):
+                is_cur = os.path.normcase(seg_path) == current
+                h.addWidget(_SegmentButton(self.panel, label, seg_path, is_cur))
+            h.addStretch()
+            self._v.addWidget(row)
+        self.setVisible(bool(self._rows))
+        self._update_height()
+        QTimer.singleShot(0, self._update_height)
+
+    def _update_height(self):
+        n = len(self._rows)
+        if not n:
+            return
+        h = n * self.ROW_H + max(0, n - 1)
+        # 横に収まらないときは横スクロールバーぶん高さを足す
+        if self._inner.sizeHint().width() > self.viewport().width():
+            h += self.horizontalScrollBar().sizeHint().height()
+        self.setFixedHeight(h + 2)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_height()
+
+
 class ExplorerPanel(QWidget):
     """右側に埋め込むファイルブラウザ（名前/サイズ/更新日時、連番まとめ対応）"""
     def __init__(self):
@@ -2770,6 +2922,10 @@ class ExplorerPanel(QWidget):
         self.tree.customContextMenuRequested.connect(self.open_context_menu)
         layout.addWidget(self.tree)
 
+        # 訪問パスのパンくず履歴（クリックで移動 / ドロップでコピー・移動）
+        self.history_bar = PathHistoryBar(self)
+        layout.addWidget(self.history_bar)
+
         # 下部ステータスバー: 「12個の項目 ｜ 1個の項目を選択 23.4 KB」
         self.status_label = QLabel("")
         self.status_label.setContentsMargins(2, 0, 2, 0)
@@ -2818,6 +2974,7 @@ class ExplorerPanel(QWidget):
             self.watcher.removePaths(old)
         if os.path.isdir(path):
             self.watcher.addPath(path)
+        self.history_bar.visit(path)
 
     def _on_path_entered(self):
         text = self.path_edit.text().strip().strip('"')
