@@ -1897,6 +1897,8 @@ class _FileTreeView(QTreeView):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Delete:
             self.panel.delete_selected()
+        elif event.key() == Qt.Key_F5:
+            self.panel.refresh()
         elif event.matches(QKeySequence.Copy):
             self.panel.clipboard_set_files(self.panel.selected_paths(), cut=False)
         elif event.matches(QKeySequence.Cut):
@@ -2933,6 +2935,10 @@ class ExplorerPanel(QWidget):
         self.up_button.setText("↑")
         self.up_button.setToolTip("上のフォルダへ")
         self.up_button.setFixedSize(26, 24)
+        self.refresh_button = QToolButton()
+        self.refresh_button.setText("↻")
+        self.refresh_button.setToolTip("最新の状態に更新 (F5)")
+        self.refresh_button.setFixedSize(26, 24)
         self.path_edit = QLineEdit()
         self.path_edit.setToolTip("パスを入力して Enter で移動")
         self.open_os_button = QToolButton()
@@ -2949,6 +2955,7 @@ class ExplorerPanel(QWidget):
         self.seq_check.setChecked(True)
         self.seq_check.setToolTip("連番ファイルを 名前.####.ext のように1行にまとめて表示")
         bar.addWidget(self.up_button)
+        bar.addWidget(self.refresh_button)
         bar.addWidget(self.path_edit)
         bar.addWidget(self.hidden_check)
         bar.addWidget(self.seq_check)
@@ -3000,6 +3007,7 @@ class ExplorerPanel(QWidget):
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(lambda _p: self.model.reload())
         self.up_button.clicked.connect(self.go_up)
+        self.refresh_button.clicked.connect(self.refresh)
         self.open_os_button.clicked.connect(self.open_in_os)
         self.seq_check.toggled.connect(self.model.set_seq_enabled)
         self.hidden_check.toggled.connect(self.model.set_show_hidden)
@@ -3039,6 +3047,19 @@ class ExplorerPanel(QWidget):
         if os.path.isdir(path):
             self.watcher.addPath(path)
         self.history_bar.visit(path)
+
+    def refresh(self):
+        """現在のフォルダを読み直す。スクロール位置は保つ。"""
+        if not self.current_root:
+            return
+        bar = self.tree.verticalScrollBar()
+        pos = bar.value()
+        self.model.reload()
+        bar.setValue(pos)
+        # 開いた時点で未マウントだった場合に備えて監視を張り直す
+        if (os.path.isdir(self.current_root)
+                and not self.watcher.directories()):
+            self.watcher.addPath(self.current_root)
 
     def _on_path_entered(self):
         text = self.path_edit.text().strip().strip('"')
