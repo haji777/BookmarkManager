@@ -12,6 +12,7 @@ import re
 import time
 import struct
 import fnmatch
+import html
 import warnings
 
 # PySide6 では QWidget.exec_() が非推奨だが、PySide2(Maya2024以前)は exec_() のみ。
@@ -34,7 +35,8 @@ try:
         QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide6.QtGui import (
-        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter,
+        QImage, QPixmap, QImageReader
     )
     from PySide6.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
@@ -52,7 +54,8 @@ except ImportError:
         QListWidget, QListWidgetItem, QScrollArea, QTreeWidget, QTreeWidgetItem
     )
     from PySide2.QtGui import (
-        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter
+        QIcon, QColor, QFont, QPalette, QDrag, QCursor, QKeySequence, QPainter,
+        QImage, QPixmap, QImageReader
     )
     from PySide2.QtCore import (
         Qt, QSize, QFileInfo, QMimeData, QUrl, QModelIndex,
@@ -82,6 +85,7 @@ DEFAULT_SETTINGS = {
     "user_name": "",          # 空ならシステムのユーザー名を使う
     "shared_project_dir": "",  # ネットワーク上の共有プロジェクトjson置き場
     "ffprobe_path": "",        # 動画メタデータ用。空なら自動検出
+    "preview_visible": "0",    # ファイルブラウザのプレビューパネル開閉状態
 }
 
 
@@ -2920,6 +2924,183 @@ class PathHistoryBar(QScrollArea):
         self._update_height()
 
 
+# ============================================================
+#  プレビュー / 詳細パネル
+# ============================================================
+PREVIEW_MAX_PX = 1024  # プレビュー用に読み込む最大辺
+
+
+def _load_image_qt(path):
+    """Qt が読める形式（png/jpg/bmp/gif/tif 等）。 -> (QImage|None, (w,h)|None)"""
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    if not reader.canRead():
+        return None, None
+    size = reader.size()
+    dims = (size.width(), size.height()) if size.isValid() else None
+    if dims and max(dims) > PREVIEW_MAX_PX:
+        reader.setScaledSize(size.scaled(PREVIEW_MAX_PX, PREVIEW_MAX_PX,
+                                         Qt.KeepAspectRatio))
+    img = reader.read()
+    if img.isNull():
+        return None, dims
+    return img, dims or (img.width(), img.height())
+
+
+def _load_image_oiio(path):
+    """EXR/HDR/DPX 等。OpenImageIO がある環境（Houdini の hython 等）だけ。"""
+    try:
+        import OpenImageIO as oiio
+        import numpy as np
+    except Exception:
+        return None, None
+    try:
+        buf = oiio.ImageBuf(path)
+        if buf.has_error:
+            buf.geterror()  # 取り出しておかないとコンソールに警告が出る
+            return None, None
+        spec = buf.spec()
+        dims = (spec.width, spec.height)
+        linear = spec.format.basetype in (oiio.HALF, oiio.FLOAT, oiio.DOUBLE)
+        order = (0, 1, 2) if spec.nchannels >= 3 else (0, 0, 0)
+        px = oiio.ImageBufAlgo.channels(buf, order).get_pixels(oiio.FLOAT)
+        step = max(1, -(-max(dims) // PREVIEW_MAX_PX))  # 間引き（切り上げ）
+        px = np.nan_to_num(px[::step, ::step, :3])
+        px = np.clip(px, 0.0, 1.0)
+        if linear:  # リニア → sRGB 相当
+            px = np.where(px <= 0.0031308, px * 12.92,
+                          1.055 * np.power(px, 1 / 2.4) - 0.055)
+        arr = np.ascontiguousarray((px * 255.0 + 0.5).astype(np.uint8))
+        h, w = arr.shape[:2]
+        img = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        return (None if img.isNull() else img), dims
+    except Exception:
+        return None, None
+
+
+def load_preview_image(path):
+    """プレビュー画像と元の解像度を返す。読めなければ (None, dims|None)。"""
+    img, dims = _load_image_qt(path)
+    if img is not None:
+        return img, dims
+    if os.path.splitext(path)[1].lower() in IMAGE_EXTS:
+        img, dims2 = _load_image_oiio(path)
+        dims = dims or dims2
+    if dims is None and path.lower().endswith(".exr"):
+        try:  # 画像は出せなくても解像度だけはヘッダーから読む
+            for name, atype, val in read_exr_header(path):
+                if name == "dataWindow" and atype == "box2i":
+                    x0, y0, x1, y1 = struct.unpack("<4i", val[:16])
+                    dims = (x1 - x0 + 1, y1 - y0 + 1)
+                    break
+        except Exception:
+            pass
+    return img, dims
+
+
+class _PreviewImage(QWidget):
+    """画像を縦横比を保って収める。透過画像は市松模様の上に描く。"""
+    def __init__(self):
+        super().__init__()
+        self._pix = None
+        self._fit = True
+        self.setMinimumSize(60, 60)
+
+    def set_pixmap(self, pix, fit=True):
+        self._pix = pix if (pix is not None and not pix.isNull()) else None
+        self._fit = fit
+        self.update()
+
+    def paintEvent(self, event):
+        if self._pix is None:
+            return
+        p = QPainter(self)
+        size = self._pix.size()
+        if self._fit or size.width() > self.width() or size.height() > self.height():
+            size = size.scaled(self.size(), Qt.KeepAspectRatio)
+        x = (self.width() - size.width()) // 2
+        y = (self.height() - size.height()) // 2
+        if self._fit and self._pix.hasAlphaChannel():
+            p.save()
+            p.setClipRect(x, y, size.width(), size.height())
+            tile = 8
+            dark, light = QColor(96, 96, 96), QColor(128, 128, 128)
+            for ty in range(0, size.height(), tile):
+                for tx in range(0, size.width(), tile):
+                    even = ((tx // tile) + (ty // tile)) % 2 == 0
+                    p.fillRect(x + tx, y + ty, tile, tile, light if even else dark)
+            p.restore()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawPixmap(x, y, size.width(), size.height(), self._pix)
+        p.end()
+
+
+class PreviewPane(QWidget):
+    """選択中の項目のプレビュー画像と詳細を表示する。"""
+    def __init__(self):
+        super().__init__()
+        self.setMinimumWidth(120)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 0, 0, 0)
+        v.setSpacing(6)
+        self.image = _PreviewImage()
+        v.addWidget(self.image, 1)
+        self.info = QLabel()
+        self.info.setWordWrap(True)
+        self.info.setTextFormat(Qt.RichText)
+        self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.info.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        v.addWidget(self.info, 0)
+        self._icons = QFileIconProvider()
+        self.show_entries([], None)
+
+    def _set_info(self, rows, title=None):
+        key = "#6cb0ff" if DARK_MODE else "#1f5fb0"
+        parts = []
+        if title:
+            parts.append(f"<div style='font-weight:bold'>{html.escape(title)}</div>")
+        if rows:
+            parts.append("<table cellspacing='0' cellpadding='1'>")
+            for k, val in rows:
+                parts.append(
+                    f"<tr><td style='color:{key}; padding-right:8px'>"
+                    f"{html.escape(str(k))}</td>"
+                    f"<td>{html.escape(str(val))}</td></tr>")
+            parts.append("</table>")
+        self.info.setText("".join(parts))
+
+    def show_entries(self, entries, model):
+        if not entries:
+            self.image.set_pixmap(None)
+            self._set_info([], "項目を選択するとプレビューを表示します")
+            return
+        if len(entries) > 1:
+            self.image.set_pixmap(None)
+            total = sum(e.size for e in entries)
+            self._set_info([("合計サイズ", human_size(total))],
+                           f"{len(entries)}個の項目を選択")
+            return
+        e = entries[0]
+        path = e.paths[0]
+        rows = []
+        if model is not None:
+            rows.append(("種類", model._type_for(e)))
+        img, dims = (None, None) if e.is_dir else load_preview_image(path)
+        if img is not None:
+            self.image.set_pixmap(QPixmap.fromImage(img), fit=True)
+        else:
+            icon = self._icons.icon(QFileInfo(path))
+            self.image.set_pixmap(icon.pixmap(64, 64), fit=False)
+        if dims:
+            rows.append(("画像サイズ", f"{dims[0]} x {dims[1]}"))
+        if not e.is_dir:
+            rows.append(("サイズ", human_size(e.size)))
+        if e.is_seq:
+            rows.append(("フレーム数", f"{len(e.paths)}（先頭フレームを表示）"))
+        rows.append(("更新日時", format_mtime(e.mtime)))
+        self._set_info(rows, e.display)
+
+
 class ExplorerPanel(QWidget):
     """右側に埋め込むファイルブラウザ（名前/サイズ/更新日時、連番まとめ対応）"""
     def __init__(self):
@@ -2954,11 +3135,17 @@ class ExplorerPanel(QWidget):
         self.seq_check = QCheckBox("seq")
         self.seq_check.setChecked(True)
         self.seq_check.setToolTip("連番ファイルを 名前.####.ext のように1行にまとめて表示")
+        self.preview_button = QToolButton()
+        self.preview_button.setText("◨")
+        self.preview_button.setToolTip("プレビュー / 詳細パネルを開閉")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setFixedSize(26, 24)
         bar.addWidget(self.up_button)
         bar.addWidget(self.refresh_button)
         bar.addWidget(self.path_edit)
         bar.addWidget(self.hidden_check)
         bar.addWidget(self.seq_check)
+        bar.addWidget(self.preview_button)
         bar.addWidget(self.open_os_button)
         bar.addWidget(self.close_button)
         layout.addLayout(bar)
@@ -2991,7 +3178,25 @@ class ExplorerPanel(QWidget):
         self.tree.doubleClicked.connect(self._on_double_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.open_context_menu)
-        layout.addWidget(self.tree)
+
+        # ファイル一覧 | プレビュー・詳細（トグルボタンで開閉、境界はドラッグで調整）
+        self.preview = PreviewPane()
+        self.body_splitter = QSplitter(Qt.Horizontal)
+        self.body_splitter.addWidget(self.tree)
+        self.body_splitter.addWidget(self.preview)
+        self.body_splitter.setCollapsible(0, False)
+        self.body_splitter.setStretchFactor(0, 1)
+        self.body_splitter.setStretchFactor(1, 0)
+        self.body_splitter.setSizes([640, 280])
+        layout.addWidget(self.body_splitter, 1)
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120)  # 連続選択中は読み込まない
+        self._preview_timer.timeout.connect(self._update_preview)
+        preview_on = GLOBAL_SETTINGS.get("preview_visible", "0") == "1"
+        self.preview_button.setChecked(preview_on)
+        self.preview.setVisible(preview_on)
+        self.preview_button.toggled.connect(self._set_preview_visible)
 
         # 訪問パスのパンくず履歴（クリックで移動 / ドロップでコピー・移動）
         self.history_bar = PathHistoryBar(self)
@@ -3021,7 +3226,29 @@ class ExplorerPanel(QWidget):
     def _selected_rows(self):
         return sorted({idx.row() for idx in self.tree.selectedIndexes()})
 
+    # ---------- プレビュー / 詳細 ----------
+    def _set_preview_visible(self, on):
+        self.preview.setVisible(on)
+        if on:
+            sizes = self.body_splitter.sizes()
+            if len(sizes) == 2 and sizes[1] < 100:  # 潰れていたら適当な幅で開く
+                total = sum(sizes)
+                side = min(300, max(120, total // 2))
+                self.body_splitter.setSizes([total - side, side])
+            self._update_preview()
+        GLOBAL_SETTINGS["preview_visible"] = "1" if on else "0"
+        save_global_settings(GLOBAL_SETTINGS)
+
+    def _update_preview(self):
+        if self.preview.isHidden():
+            return
+        entries = [self.model.entry_at(self.model.index(r, 0))
+                   for r in self._selected_rows()]
+        self.preview.show_entries([e for e in entries if e], self.model)
+
     def _update_status(self):
+        if not self.preview.isHidden():
+            self._preview_timer.start()
         total = self.model.rowCount()
         rows = self._selected_rows()
         if rows:
