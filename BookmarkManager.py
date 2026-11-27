@@ -950,6 +950,16 @@ class BookmarkTableWidget(QTableWidget):
                         event.setDropAction(Qt.CopyAction)
                         event.accept()
                         return
+                    links = web_links_from_mime(md)
+                    if links:  # ブラウザからの URL → そのフォルダに .url を作成
+                        try:
+                            create_url_shortcuts(links, dest)
+                        except OSError as e:
+                            QMessageBox.warning(
+                                self, "エラー", f"ショートカットを作成できません: {e}")
+                        event.setDropAction(Qt.CopyAction)
+                        event.accept()
+                        return
             # 空きスペースへのドロップ → ブックマーク登録
             if md.hasFormat(SEQ_MIME):
                 # 連番のまとめ行は登録禁止
@@ -1971,6 +1981,65 @@ def _accept_file_drag(event):
         event.ignore()
 
 
+# ------------------------------------------------------------
+#  Web の URL のドロップ（ブラウザのアドレスバー等）→ .url ショートカット作成
+# ------------------------------------------------------------
+_FILEGROUP_MIME = 'application/x-qt-windows-mime;value="FileGroupDescriptorW"'
+_MOZ_URL_MIME = 'application/x-qt-windows-mime;value="text/x-moz-url"'
+
+
+def _dropped_link_title(md):
+    """ドロップされたリンクのページタイトル（取れなければ ""）。"""
+    try:
+        if md.hasFormat(_FILEGROUP_MIME):
+            # FILEGROUPDESCRIPTORW: UINT cItems; FILEDESCRIPTORW[0].cFileName は +72
+            raw = bytes(md.data(_FILEGROUP_MIME))
+            name = raw[76:76 + 520].decode("utf-16-le", "ignore").split("\0")[0]
+            if name.lower().endswith(".url"):
+                name = name[:-4]
+            if name.strip():
+                return name.strip()
+        if md.hasFormat(_MOZ_URL_MIME):  # "URL\nタイトル" (UTF-16)
+            text = bytes(md.data(_MOZ_URL_MIME)).decode("utf-16-le", "ignore")
+            lines = text.replace("\0", "").splitlines()
+            if len(lines) >= 2 and lines[1].strip():
+                return lines[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def web_links_from_mime(md):
+    """ローカルファイルではない URL（http/https 等）を [(url, title), ...] で返す。"""
+    if md is None or not md.hasUrls():
+        return []
+    urls = [u for u in md.urls()
+            if not u.isLocalFile() and u.scheme() and u.host()]
+    if not urls:
+        return []
+    title = _dropped_link_title(md) if len(urls) == 1 else ""
+    return [(bytes(u.toEncoded()).decode("ascii", "ignore"), title or u.host())
+            for u in urls]
+
+
+def safe_file_name(name, max_len=120):
+    """ファイル名に使えない文字を除く。"""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:max_len].rstrip(" .") or "link"
+
+
+def create_url_shortcuts(links, dest_dir):
+    """dest_dir に .url（インターネットショートカット）を作る。作成したパス一覧を返す。"""
+    created = []
+    for url, title in links:
+        path = unique_path(dest_dir, safe_file_name(title) + ".url")
+        with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("[InternetShortcut]\nURL=%s\n" % url)
+        created.append(path)
+    return created
+
+
 FO_MOVE, FO_COPY, FO_DELETE = 1, 2, 3
 FOF_ALLOWUNDO = 0x0040
 FOF_NOCONFIRMATION = 0x0010
@@ -2120,6 +2189,13 @@ class _FileTreeView(QTreeView):
         sources = [s for s in sources if s]
         if sources and dest:
             self.panel.handle_external_drop(sources, dest)
+        elif dest:
+            links = web_links_from_mime(md)  # ブラウザからの URL → .url を作成
+            if links:
+                self.panel.drop_web_links(links, dest)
+                event.setDropAction(Qt.CopyAction)
+                event.accept()
+                return
         event.acceptProposedAction()
 
 
@@ -3000,6 +3076,10 @@ class _SegmentButton(QToolButton):
             self.panel.drop_archive_items(archive_items, self.path)
         elif sources and os.path.isdir(self.path):
             self.panel.handle_external_drop(sources, self.path)
+        elif os.path.isdir(self.path):
+            links = web_links_from_mime(md)
+            if links:
+                self.panel.drop_web_links(links, self.path)
         # コピー扱いにして、ドラッグ元側でファイルが消されないようにする
         event.setDropAction(Qt.CopyAction)
         event.accept()
@@ -3562,6 +3642,14 @@ class ExplorerPanel(QWidget):
     def clipboard_has_files(self):
         md = QApplication.clipboard().mimeData()
         return bool(md and (md.hasUrls() or md.hasFormat(SHELL_IDLIST_MIME)))
+
+    def drop_web_links(self, links, dest_dir):
+        """ブラウザからドロップされた URL を .url ショートカットとして作成する。"""
+        try:
+            create_url_shortcuts(links, dest_dir)
+        except OSError as e:
+            QMessageBox.warning(self, "エラー", f"ショートカットを作成できません: {e}")
+        self.model.reload()
 
     def drop_archive_items(self, items, dest_dir):
         """zip の中の項目を dest_dir へ取り出してコピーする。"""
