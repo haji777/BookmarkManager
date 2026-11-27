@@ -878,7 +878,8 @@ class BookmarkTableWidget(QTableWidget):
     def _accepts_drag(self, event):
         md = event.mimeData()
         return (event.source() is self or md.hasUrls()
-                or md.hasFormat(PATH_BUTTON_MIME))
+                or md.hasFormat(PATH_BUTTON_MIME)
+                or md.hasFormat(SHELL_IDLIST_MIME))
 
     def dragEnterEvent(self, event):
         if self._accepts_drag(event):
@@ -967,6 +968,20 @@ class BookmarkTableWidget(QTableWidget):
             # コピー扱いにして、ドラッグ元のファイルが移動・削除されないようにする
             event.setDropAction(Qt.CopyAction)
             event.accept()
+        elif event.mimeData().hasFormat(SHELL_IDLIST_MIME):
+            # --- zip の中の項目 → ブックマーク(フォルダ)の上に落としたらそこへコピー ---
+            items = archive_items_from_mime(event.mimeData())
+            row = self.rowAt(_event_pos(event).y())
+            dest = ""
+            if row >= 0:
+                _, path, _c = self.row_data(row)
+                dest = resolve_path(path, self.parent_tab) if path else ""
+            if items and dest and os.path.isdir(dest):
+                copy_archive_items(self, items, dest)
+                event.setDropAction(Qt.CopyAction)
+                event.accept()
+            else:
+                event.ignore()  # 空きスペース: 書庫の中身はブックマーク登録できない
         else:
             event.ignore()
 
@@ -1798,6 +1813,164 @@ def _unique_copy_name(dir_path, src_name):
         i += 1
 
 
+# ------------------------------------------------------------
+#  書庫(zip)の中身のドロップ対応
+#  エクスプローラで zip の中を開いてドラッグした項目は実ファイルではないため
+#  URL(ファイルパス)を持たず、シェル上の場所(Shell IDList)だけが渡ってくる。
+# ------------------------------------------------------------
+SHELL_IDLIST_MIME = 'application/x-qt-windows-mime;value="Shell IDList Array"'
+_SIGDN_DESKTOPABSOLUTEPARSING = 0x80028000
+
+
+def _cida_to_paths(data):
+    """CFSTR_SHELLIDLIST (CIDA) のバイト列 -> 各項目のパース名
+    （例: C:\\dir\\a.zip\\sub\\file.txt）。"""
+    paths = []
+    try:
+        shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+        shell32.ILCombine.restype = ctypes.c_void_p
+        shell32.ILCombine.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        shell32.ILFree.restype = None
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.SHGetNameFromIDList.restype = ctypes.c_long
+        shell32.SHGetNameFromIDList.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        ole32.CoTaskMemFree.restype = None
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+        (count,) = struct.unpack_from("<I", data, 0)
+        offsets = struct.unpack_from("<%dI" % (count + 1), data, 4)
+        folder = ctypes.create_string_buffer(data[offsets[0]:] + b"\0\0")
+        for off in offsets[1:]:
+            child = ctypes.create_string_buffer(data[off:] + b"\0\0")
+            pidl = shell32.ILCombine(folder, child)
+            if not pidl:
+                continue
+            try:
+                out = ctypes.c_void_p()
+                hr = shell32.SHGetNameFromIDList(
+                    pidl, _SIGDN_DESKTOPABSOLUTEPARSING, ctypes.byref(out))
+                if hr == 0 and out.value:
+                    paths.append(ctypes.wstring_at(out.value))
+                    ole32.CoTaskMemFree(out)
+            finally:
+                shell32.ILFree(pidl)
+    except Exception as e:
+        print(f"Shell IDList の解析に失敗: {e}")
+    return paths
+
+
+def split_archive_path(path):
+    """C:\\dir\\a.zip\\sub\\f.txt -> ("C:\\dir\\a.zip", "sub/f.txt")。
+    書庫の中の項目でなければ None。"""
+    p = os.path.normpath(path)
+    inner = []
+    while p and not os.path.exists(p):
+        parent, name = os.path.split(p)
+        if parent == p or not name:
+            return None
+        inner.insert(0, name)
+        p = parent
+    if inner and os.path.isfile(p):
+        return p, "/".join(inner)
+    return None
+
+
+def archive_items_from_mime(md):
+    """ドロップ/クリップボードのデータから「書庫の中の項目」のパース名一覧を返す。
+    通常のファイル(URLあり)の場合は空。"""
+    if md is None or md.hasUrls() or not md.hasFormat(SHELL_IDLIST_MIME):
+        return []
+    paths = _cida_to_paths(bytes(md.data(SHELL_IDLIST_MIME)))
+    return [p for p in paths if split_archive_path(p)]
+
+
+def extract_zip_item(archive, inner, dest_dir):
+    """zip 内の 1 項目(ファイル or フォルダ)を dest_dir へ取り出す。作成したパスを返す。
+    同名があれば上書きせず「名前 (2)」のように別名にする。"""
+    import zipfile
+    inner = inner.strip("/")
+    key = inner.casefold()
+    target_top = unique_path(dest_dir, inner.split("/")[-1])
+    top_norm = os.path.normpath(target_top)
+    found = False
+    with zipfile.ZipFile(archive) as z:
+        for info in z.infolist():
+            names = [info.filename]
+            if not info.flag_bits & 0x800:  # UTF-8フラグなし = 古い日本語zip(cp932)の可能性
+                try:
+                    names.append(info.filename.encode("cp437").decode("cp932"))
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass
+            for name in names:
+                name = name.replace("\\", "/")
+                if name.rstrip("/").casefold() == key:
+                    rel = []
+                elif name.casefold().startswith(key + "/"):
+                    rel = [s for s in name[len(inner) + 1:].split("/") if s]
+                else:
+                    continue
+                if ".." in rel:
+                    break
+                target = os.path.normpath(os.path.join(target_top, *rel))
+                if target != top_norm and not target.startswith(top_norm + os.sep):
+                    break
+                if name.endswith("/"):
+                    os.makedirs(target, exist_ok=True)
+                else:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with z.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    try:
+                        t = time.mktime(tuple(info.date_time) + (0, 0, -1))
+                        os.utime(target, (t, t))
+                    except (ValueError, OverflowError, OSError):
+                        pass
+                found = True
+                break
+    if not found:
+        raise FileNotFoundError(f"書庫内に見つかりません: {inner}")
+    return target_top
+
+
+def copy_archive_items(parent, items, dest_dir):
+    """書庫の中の項目(パース名のリスト)を dest_dir へコピーする。成功数を返す。"""
+    import zipfile
+    done, errors = 0, []
+    QApplication.setOverrideCursor(Qt.WaitCursor)
+    try:
+        for item in items:
+            split = split_archive_path(item)
+            if not split:
+                continue
+            archive, inner = split
+            try:
+                if not zipfile.is_zipfile(archive):
+                    raise RuntimeError("zip 以外の書庫には対応していません")
+                extract_zip_item(archive, inner, dest_dir)
+                done += 1
+            except Exception as e:
+                errors.append(f"{os.path.basename(item)}: {e}")
+    finally:
+        QApplication.restoreOverrideCursor()
+    if errors:
+        QMessageBox.warning(parent, "エラー",
+                            "コピーできなかった項目があります:\n" + "\n".join(errors))
+    return done
+
+
+def _accept_file_drag(event):
+    """通常のファイル、または書庫の中の項目のドラッグなら受け付ける。"""
+    md = event.mimeData()
+    if md.hasUrls():
+        event.acceptProposedAction()
+    elif md.hasFormat(SHELL_IDLIST_MIME):
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+    else:
+        event.ignore()
+
+
 FO_MOVE, FO_COPY, FO_DELETE = 1, 2, 3
 FOF_ALLOWUNDO = 0x0040
 FOF_NOCONFIRMATION = 0x0010
@@ -1918,20 +2091,15 @@ class _FileTreeView(QTreeView):
         super().startDrag(Qt.CopyAction)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        _accept_file_drag(event)
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        _accept_file_drag(event)
 
     def dropEvent(self, event):
         md = event.mimeData()
-        if not md.hasUrls():
+        archive_items = archive_items_from_mime(md)
+        if not md.hasUrls() and not archive_items:
             event.ignore()
             return
         pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
@@ -1941,6 +2109,13 @@ class _FileTreeView(QTreeView):
             dest = p if os.path.isdir(p) else os.path.dirname(p)
         else:
             dest = self.panel.current_root
+        if archive_items:
+            # zip の中からのドラッグ → 取り出してコピー（移動はできない）
+            if dest:
+                self.panel.drop_archive_items(archive_items, dest)
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+            return
         sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
         sources = [s for s in sources if s]
         if sources and dest:
@@ -2811,22 +2986,19 @@ class _SegmentButton(QToolButton):
         super().mouseMoveEvent(event)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        _accept_file_drag(event)
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        _accept_file_drag(event)
 
     def dropEvent(self, event):
         md = event.mimeData()
+        archive_items = archive_items_from_mime(md)
         sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
         sources = [s for s in sources if s and os.path.exists(s)]
-        if sources and os.path.isdir(self.path):
+        if archive_items and os.path.isdir(self.path):
+            self.panel.drop_archive_items(archive_items, self.path)
+        elif sources and os.path.isdir(self.path):
             self.panel.handle_external_drop(sources, self.path)
         # コピー扱いにして、ドラッグ元側でファイルが消されないようにする
         event.setDropAction(Qt.CopyAction)
@@ -3389,11 +3561,22 @@ class ExplorerPanel(QWidget):
 
     def clipboard_has_files(self):
         md = QApplication.clipboard().mimeData()
-        return bool(md and md.hasUrls())
+        return bool(md and (md.hasUrls() or md.hasFormat(SHELL_IDLIST_MIME)))
+
+    def drop_archive_items(self, items, dest_dir):
+        """zip の中の項目を dest_dir へ取り出してコピーする。"""
+        copy_archive_items(self, items, dest_dir)
+        self.model.reload()
 
     def paste_into(self, dest_dir):
         md = QApplication.clipboard().mimeData()
-        if not (md and md.hasUrls() and os.path.isdir(dest_dir)):
+        if not (md and os.path.isdir(dest_dir)):
+            return
+        archive_items = archive_items_from_mime(md)
+        if archive_items:  # エクスプローラで zip の中の項目をコピーした場合
+            self.drop_archive_items(archive_items, dest_dir)
+            return
+        if not md.hasUrls():
             return
         sources = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
         sources = [s for s in sources if s and os.path.exists(s)]
