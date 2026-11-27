@@ -86,6 +86,7 @@ DEFAULT_SETTINGS = {
     "shared_project_dir": "",  # ネットワーク上の共有プロジェクトjson置き場
     "ffprobe_path": "",        # 動画メタデータ用。空なら自動検出
     "preview_visible": "0",    # ファイルブラウザのプレビューパネル開閉状態
+    "path_backslash": "0",     # アドレスバーの区切り: 0 = /  1 = \
 }
 
 
@@ -1694,9 +1695,20 @@ def load_workspace():
 # ============================================================
 #  Windows シェル操作ヘルパー
 # ============================================================
+def format_path(path, backslash=False):
+    """パスを / 区切り（backslash=True なら \\ 区切り）の文字列にする"""
+    text = os.path.normpath(path)
+    return text.replace("/", "\\") if backslash else text.replace("\\", "/")
+
+
 def copy_path_forward_slash(path):
     """パスを / 区切りにしてクリップボードへ"""
-    text = os.path.normpath(path).replace("\\", "/")
+    return copy_path(path, backslash=False)
+
+
+def copy_path(path, backslash=False):
+    """パスを指定の区切り文字でクリップボードへ"""
+    text = format_path(path, backslash)
     cb = QApplication.clipboard()
     if cb:
         cb.setText(text)
@@ -3374,6 +3386,11 @@ class ExplorerPanel(QWidget):
         self.refresh_button.setFixedSize(26, 24)
         self.path_edit = QLineEdit()
         self.path_edit.setToolTip("パスを入力して Enter で移動")
+        # アドレスバーの区切り文字切り替え（表示中の文字が現在の区切り）
+        self.path_backslash = GLOBAL_SETTINGS.get("path_backslash", "0") == "1"
+        self.sep_button = QToolButton()
+        self.sep_button.setFixedSize(26, 24)
+        self._update_sep_button()
         self.open_os_button = QToolButton()
         self.open_os_button.setText("⧉")
         self.open_os_button.setToolTip("エクスプローラで開く")
@@ -3395,6 +3412,7 @@ class ExplorerPanel(QWidget):
         bar.addWidget(self.up_button)
         bar.addWidget(self.refresh_button)
         bar.addWidget(self.path_edit)
+        bar.addWidget(self.sep_button)
         bar.addWidget(self.hidden_check)
         bar.addWidget(self.seq_check)
         bar.addWidget(self.preview_button)
@@ -3465,6 +3483,7 @@ class ExplorerPanel(QWidget):
         self.watcher.directoryChanged.connect(lambda _p: self.model.reload())
         self.up_button.clicked.connect(self.go_up)
         self.refresh_button.clicked.connect(self.refresh)
+        self.sep_button.clicked.connect(self.toggle_path_separator)
         self.open_os_button.clicked.connect(self.open_in_os)
         self.seq_check.toggled.connect(self.model.set_seq_enabled)
         self.hidden_check.toggled.connect(self.model.set_show_hidden)
@@ -3514,11 +3533,28 @@ class ExplorerPanel(QWidget):
         else:
             self.status_label.setText(f"{total}個の項目")
 
+    # ---------- アドレスバーの区切り文字 ----------
+    def _update_sep_button(self):
+        self.sep_button.setText("\\" if self.path_backslash else "/")
+        self.sep_button.setToolTip(
+            "アドレスバーの区切り文字: %s\nクリックで %s に切り替え"
+            % (("\\", "/") if self.path_backslash else ("/", "\\")))
+
+    def toggle_path_separator(self):
+        self.path_backslash = not self.path_backslash
+        self._update_sep_button()
+        # 編集途中の文字列も含めて、表示中のテキストをそのまま変換する
+        text = self.path_edit.text()
+        self.path_edit.setText(text.replace("/", "\\") if self.path_backslash
+                               else text.replace("\\", "/"))
+        GLOBAL_SETTINGS["path_backslash"] = "1" if self.path_backslash else "0"
+        save_global_settings(GLOBAL_SETTINGS)
+
     def set_root(self, path):
         self.current_root = path
         self.model.set_directory(path)
-        # パス表示は常に / 区切り
-        self.path_edit.setText(os.path.normpath(path).replace("\\", "/"))
+        # パス表示は区切りボタンの設定に従う（既定は /）
+        self.path_edit.setText(format_path(path, self.path_backslash))
         self.tree.scrollToTop()
         old = self.watcher.directories()
         if old:
@@ -3551,10 +3587,10 @@ class ExplorerPanel(QWidget):
             self.set_root(os.path.dirname(p))  # ファイル指定ならその親へ
         else:
             QMessageBox.warning(self, "エラー", "パスが見つかりません:\n" + text)
-            # 表示を現在地へ戻す（/ 区切り）
+            # 表示を現在地へ戻す
             if self.current_root:
                 self.path_edit.setText(
-                    os.path.normpath(self.current_root).replace("\\", "/"))
+                    format_path(self.current_root, self.path_backslash))
 
     def go_up(self):
         if not self.current_root:
@@ -3753,6 +3789,7 @@ class ExplorerPanel(QWidget):
         act_bookmark = menu.addAction("ブックマークに追加")
         menu.addSeparator()
         act_copy = menu.addAction("パスをコピー")
+        act_copy_bs = menu.addAction("パスをコピー (バックスラッシュ)")
         act_explorer = menu.addAction("エクスプローラで開く")
         act_terminal = menu.addAction("ターミナルで開く")
         menu.addSeparator()
@@ -3796,6 +3833,8 @@ class ExplorerPanel(QWidget):
                     self.add_bookmark_callback(target)
             elif action == act_copy:
                 copy_path_forward_slash(target)
+            elif action == act_copy_bs:
+                copy_path(target, backslash=True)
             elif action == act_explorer:
                 reveal_in_explorer(target)
             elif action == act_terminal:
