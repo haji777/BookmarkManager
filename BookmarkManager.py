@@ -1369,7 +1369,6 @@ class ProjectTab(QWidget):
         self.remove_bookmark_button = QToolButton()
         self.sort_bookmark_button = QToolButton()
         self.reload_button = QToolButton()
-        self.new_project_button = QToolButton()
         self.settings_button = QToolButton()
 
         # 設定ボタンと同じグリフ方式に統一（ダークでも見えるようにアイコン画像は使わない）
@@ -1377,17 +1376,16 @@ class ProjectTab(QWidget):
         self.remove_bookmark_button.setText("－")
         self.sort_bookmark_button.setText("⇅")
         self.reload_button.setText("↻")
-        self.new_project_button.setText("⊞")
         self.settings_button.setText("⚙")
+        # 新規プロジェクトボタンはプロジェクトタブの右隣（_ProjectTabBar）にある
         for b in (self.add_bookmark_button, self.remove_bookmark_button,
                   self.sort_bookmark_button, self.reload_button,
-                  self.new_project_button, self.settings_button):
+                  self.settings_button):
             b.setFixedSize(26, 24)
         self.add_bookmark_button.setToolTip("ブックマーク追加")
         self.remove_bookmark_button.setToolTip("選択を削除 (Delキー)")
         self.sort_bookmark_button.setToolTip("名前で並べ替え")
         self.reload_button.setToolTip("再読み込み（ボタンのアイコン・ドライブ使用量）")
-        self.new_project_button.setToolTip("新規プロジェクト")
         self.settings_button.setToolTip("設定")
 
         self.bookmark_button_layout.addWidget(self.add_bookmark_button)
@@ -1395,7 +1393,6 @@ class ProjectTab(QWidget):
         self.bookmark_button_layout.addWidget(self.sort_bookmark_button)
         self.bookmark_button_layout.addStretch()
         self.bookmark_button_layout.addWidget(self.reload_button)
-        self.bookmark_button_layout.addWidget(self.new_project_button)
         self.bookmark_button_layout.addWidget(self.settings_button)
         self.layout.addLayout(self.bookmark_button_layout)
 
@@ -1405,7 +1402,6 @@ class ProjectTab(QWidget):
         self.remove_bookmark_button.clicked.connect(self.table.delete_selected_rows)
         self.sort_bookmark_button.clicked.connect(self.sort_bookmarks)
         self.reload_button.clicked.connect(self.reload_buttons)
-        self.new_project_button.clicked.connect(self.add_project_callback)
         self.settings_button.clicked.connect(lambda: self.open_settings_callback(self))
 
         self.load_bookmarks()
@@ -4136,10 +4132,50 @@ class EpSqShotDialog(QDialog):
 
 class _ProjectTabBar(QTabBar):
     """ブックマークをタブにドロップしてプロジェクト間移動できるタブバー。"""
-    def __init__(self, on_drop):
+    def __init__(self, on_drop, on_new_project=None):
         super().__init__()
         self.on_drop = on_drop
         self.setAcceptDrops(True)
+        # 最後のタブのすぐ右に置く「新規プロジェクト」ボタン（ブラウザの + と同じ位置）
+        self.new_button = QToolButton(self)
+        self.new_button.setText("＋")
+        self.new_button.setToolTip("新規プロジェクト")
+        self.new_button.setStyleSheet("QToolButton { padding: 0px; }")
+        self.new_button.setFocusPolicy(Qt.NoFocus)
+        if on_new_project:
+            self.new_button.clicked.connect(lambda: on_new_project())
+
+    def _place_new_button(self):
+        b = self.new_button
+        side = max(16, min(22, self.height() - 4))
+        b.setFixedSize(side + 2, side)
+        n = self.count()
+        x = self.tabRect(n - 1).right() + 5 if n else 2
+        # タブが溢れてスクロール矢印が出ているときは、その左隣に留める
+        limit = self.width() - b.width() - 1
+        for c in self.findChildren(QToolButton):
+            if c is not b and c.isVisibleTo(self):
+                limit = min(limit, c.x() - b.width() - 2)
+        b.move(max(0, min(x, limit)), max(0, (self.height() - b.height()) // 2))
+        b.raise_()
+
+    def minimumSizeHint(self):
+        # タブが1つも無くてもボタンの分の高さ・幅は確保する
+        s = super().minimumSizeHint()
+        return s.expandedTo(QSize(self.new_button.width() + 4, 0))
+
+    def _schedule_place(self):
+        self._place_new_button()
+        # Qt5 ではスクロール矢印の表示/非表示がこの後に切り替わるので、もう一度合わせる
+        QTimer.singleShot(0, self._place_new_button)
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        self._schedule_place()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_place()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat(BOOKMARK_MIME):
@@ -4174,7 +4210,8 @@ class ProjectManager(QWidget):
         self.layout.setSpacing(4)
 
         self.tab_widget = QTabWidget()
-        self.tab_widget.setTabBar(_ProjectTabBar(self._drop_bookmarks_on_tab))
+        self.tab_widget.setTabBar(_ProjectTabBar(self._drop_bookmarks_on_tab,
+                                                 self.add_new_project))
         self.tab_widget.setDocumentMode(True)
         self.tab_widget.setMovable(True)  # タブをドラッグで並べ替え
         self.tab_widget.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
